@@ -1,0 +1,1388 @@
+#!/usr/bin/env python3
+
+import curses
+import json
+import subprocess
+import time
+from datetime import datetime
+import fnmatch
+import os
+import threading
+import queue
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+class PipelineError(Exception):
+    """Custom exception for pipeline operations"""
+    pass
+
+def execute_aws_command(cmd_args):
+    """Execute AWS CLI command with error handling"""
+    try:
+        result = subprocess.run(
+            cmd_args,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        raise PipelineError(f"AWS CLI error: {e.stderr}")
+    except json.JSONDecodeError as e:
+        raise PipelineError(f"Invalid JSON response: {e}")
+
+def load_config():
+    """Load configuration from config file"""
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    try:
+        with open(config_path) as f:
+            return json.load(f)
+    except Exception as e:
+        return {'pipeline_filter': '*uva-drupal*'}  # Default config
+
+def update_config(new_filter=None):
+    """Update configuration file with new settings"""
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    try:
+        # Load existing config or create default
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            config = {'pipeline_filter': '*', 'refresh_interval': 30}
+        
+        # Update with new values
+        if new_filter:
+            # Add wildcards if none present
+            if '*' not in new_filter and '?' not in new_filter:
+                new_filter = f"*{new_filter}*"
+            
+            config['pipeline_filter'] = new_filter
+            
+        # Write back to file
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+            
+        return config
+    except Exception as e:
+        raise Exception(f"Failed to update config: {str(e)}")
+
+def show_filter_prompt(stdscr, old_filter):
+    """Show prompt to change filter pattern"""
+    height, width = stdscr.getmaxyx()
+    
+    # Draw prompt box
+    prompt_h = 7  # Increased height to accommodate the help text
+    prompt_w = min(60, width - 4)
+    prompt_y = (height - prompt_h) // 2
+    prompt_x = (width - prompt_w) // 2
+    
+    # Create a new window for the prompt
+    prompt_win = curses.newwin(prompt_h, prompt_w, prompt_y, prompt_x)
+    prompt_win.box()
+    
+    # Draw prompt content
+    prompt_win.addstr(1, 2, f"Current filter: {old_filter}")
+    prompt_win.addstr(2, 2, "Enter new filter pattern:")
+    prompt_win.addstr(3, 2, "(Wildcards * ? will be added if none present)")
+    prompt_win.refresh()
+    
+    # Create input window (window within the prompt window)
+    input_win = curses.newwin(1, prompt_w-6, prompt_y+4, prompt_x+3)
+    input_win.keypad(True)
+    
+    # Initialize input handling
+    curses.curs_set(1)  # Show cursor
+    curses.echo()       # Show typed characters
+    
+    # Get user input
+    new_filter = input_win.getstr(0, 0).decode('utf-8')
+    
+    # Reset terminal settings
+    curses.noecho()
+    curses.curs_set(0)  # Hide cursor
+    
+    # Return empty string if user just pressed Enter
+    if not new_filter or new_filter.strip() == '':
+        return None
+    
+    # Clean up any leading/trailing whitespace
+    new_filter = new_filter.strip()
+        
+    return new_filter
+
+def get_pipelines():
+    """Get list of CodePipeline pipelines"""
+    try:
+        data = execute_aws_command(['aws', 'codepipeline', 'list-pipelines'])
+        pipelines = data['pipelines']
+        
+        # Filter pipelines based on config
+        config = load_config()
+        pattern = config.get('pipeline_filter', '*')
+        return [p for p in pipelines if fnmatch.fnmatch(p['name'], pattern)]
+    except PipelineError as e:
+        return []
+
+def get_pipeline_executions(pipeline_name, max_items=5):
+    """Get recent executions of a pipeline"""
+    try:
+        cmd = ['aws', 'codepipeline', 'list-pipeline-executions', '--pipeline-name', pipeline_name, '--max-items', str(max_items)]
+        data = execute_aws_command(cmd)
+        
+        executions = data.get('pipelineExecutionSummaries', [])
+        return executions
+    except PipelineError as e:
+        return []
+    except Exception as e:
+        return []
+
+def get_pipeline_execution_details(pipeline_name, execution_id):
+    """Get detailed information about a specific pipeline execution"""
+    try:
+        cmd = ['aws', 'codepipeline', 'get-pipeline-execution', 
+               '--pipeline-name', pipeline_name, 
+               '--pipeline-execution-id', execution_id]
+        data = execute_aws_command(cmd)
+        
+        return data.get('pipelineExecution', {})
+    except Exception as e:
+        return {'error': str(e)}
+
+def extract_stage_details_from_execution(execution):
+    """Extract stage details from execution data"""
+    result = {}
+    
+    # Get stage states from the execution if available
+    stage_states = execution.get('stageStates', [])
+    for stage in stage_states:
+        stage_name = stage.get('stageName')
+        if not stage_name:
+            continue
+            
+        # Get action states for this stage
+        action_states = stage.get('actionStates', [])
+        actions = []
+        
+        for action in action_states:
+            action_name = action.get('actionName', 'Unknown')
+            last_status = action.get('latestExecution', {}).get('status', 'Unknown')
+            last_update = action.get('latestExecution', {}).get('lastStatusChange')
+            
+            # Get error message if available
+            error_details = action.get('latestExecution', {}).get('errorDetails', {})
+            error_message = error_details.get('message') if error_details else None
+            
+            # Extract any output variables/artifacts
+            output = action.get('latestExecution', {}).get('output', {})
+            output_artifacts = output.get('outputArtifacts', [])
+            
+            actions.append({
+                'name': action_name,
+                'status': last_status,
+                'lastUpdate': last_update,
+                'error': error_message,
+                'outputArtifacts': output_artifacts
+            })
+        
+        # Store the stage details
+        result[stage_name] = {
+            'actions': actions,
+            'lastUpdateTime': stage.get('latestExecution', {}).get('lastStatusChange'),
+            'status': stage.get('latestExecution', {}).get('status', 'Unknown'),
+            'inboundTransitions': stage.get('inboundTransitionState', {})
+        }
+    
+    return result
+
+def enrich_pipeline_state(pipeline_name, state):
+    """Add execution history details to pipeline state"""
+    if 'error' in state and state['error']:
+        return state  # Don't try to enrich state if there was an error
+        
+    try:
+        executions = get_pipeline_executions(pipeline_name, max_items=5)
+        
+        if executions:
+            # Add executions list to state
+            state['executions'] = executions
+            
+            # Add the most recent execution details to state
+            latest = executions[0]
+            execution_id = latest.get('pipelineExecutionId')
+            
+            # Extract stage information directly from execution data
+            if execution_id:
+                # Set stage_details from the executions data
+                latest_stage_details = extract_stage_details_from_execution(latest)
+                state['stageDetails'] = latest_stage_details
+                
+                # Get detailed execution information 
+                execution_details = get_pipeline_execution_details(pipeline_name, execution_id)
+                state['executionDetails'] = execution_details
+                
+                # Enhance stage information with execution details
+                if 'stages' in state and 'stageDetails' in state:
+                    for stage in state['stages']:
+                        stage_name = stage.get('stageName')
+                        if stage_name in state['stageDetails']:
+                            # Enhance stage with details from execution
+                            details = state['stageDetails'][stage_name]
+                            
+                            # Add action details to stage execution
+                            if 'latestExecution' not in stage:
+                                stage['latestExecution'] = {}
+                            
+                            stage['latestExecution']['actions'] = details.get('actions', [])
+                            
+                            # Make sure we have timestamp info
+                            if 'lastUpdateTime' in details and details['lastUpdateTime']:
+                                stage['latestExecution']['lastUpdateTime'] = details['lastUpdateTime']
+            
+                # Add commit info if available
+                if 'artifactRevisions' in execution_details:
+                    # Add commit info to stage details
+                    for artifact in execution_details.get('artifactRevisions', []):
+                        revision_info = {
+                            'revisionId': artifact.get('revisionId', ''),
+                            'revisionUrl': artifact.get('revisionUrl', ''),
+                            'revisionSummary': artifact.get('revisionSummary', ''),
+                            'revisionAuthor': artifact.get('revisionAuthor', '')
+                        }
+                        state['commitInfo'] = revision_info
+            
+            # Add last start time, status, etc. to the main state info for quick access
+            state['lastStartTime'] = latest.get('startTime', 'Unknown')
+            state['lastStatus'] = latest.get('status', 'Unknown')
+            
+            # If there was a trigger, add that info
+            if 'trigger' in latest:
+                trigger_type = latest['trigger'].get('triggerType', 'Unknown')
+                state['lastTriggerType'] = trigger_type
+                
+                # Add specific details based on trigger type
+                if trigger_type == 'GitPush':
+                    state['lastTriggerDetail'] = f"Git: {latest['trigger'].get('gitPushDetails', {}).get('repositoryName', 'Unknown')}"
+                elif trigger_type == 'WebhookV2':
+                    state['lastTriggerDetail'] = f"Webhook: {latest['trigger'].get('webhookV2Details', {}).get('event', 'Unknown')}"
+                elif trigger_type == 'Manual':
+                    state['lastTriggerDetail'] = f"Manual by: {latest['trigger'].get('triggerDetail', 'Unknown user')}"
+                else:
+                    state['lastTriggerDetail'] = latest['trigger'].get('triggerDetail', 'Unknown')
+            
+            # Calculate execution duration if available
+            if 'startTime' in latest and 'lastUpdateTime' in latest:
+                start = latest['startTime']
+                end = latest.get('lastUpdateTime', datetime.now(start.tzinfo))
+                duration = end - start
+                # Format duration as minutes:seconds
+                minutes, seconds = divmod(duration.seconds, 60)
+                state['lastDuration'] = f"{minutes}m {seconds}s"
+                
+                # If still in progress, note that the duration is ongoing
+                if latest.get('status') == 'InProgress':
+                    state['lastDuration'] += " (ongoing)"
+            
+        return state
+    except Exception as e:
+        # Don't fail if we can't get execution history
+        state['executionError'] = str(e)
+        return state
+
+def get_pipeline_state(pipeline_name):
+    """Get current state of a pipeline"""
+    try:
+        data = execute_aws_command(['aws', 'codepipeline', 'get-pipeline-state', '--name', pipeline_name])
+        
+        # Validate response structure
+        if not isinstance(data, dict):
+            raise PipelineError(f"Invalid response format for pipeline {pipeline_name}")
+            
+        # Extract stages with validation
+        stages = data.get('stageStates', [])
+        if not isinstance(stages, list):
+            raise PipelineError(f"Invalid stages format for pipeline {pipeline_name}")
+            
+        # For each stage, ensure it has the required structure
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            if 'latestExecution' not in stage:
+                stage['latestExecution'] = {'status': 'Unknown'}
+            if 'stageName' not in stage:
+                stage['stageName'] = 'Unknown'
+
+        state = {
+            'stages': stages,
+            'error': None,
+            'status': data.get('pipelineExecutionId', 'Unknown'),
+            'updated': data.get('updated', datetime.now().isoformat()),
+            'created': data.get('created', 'Unknown')
+        }
+        
+        # Enrich with execution history
+        state = enrich_pipeline_state(pipeline_name, state)
+        
+        return state
+        
+    except PipelineError as e:
+        return {
+            'stages': [],
+            'error': str(e),
+            'status': 'ERROR',
+            'updated': datetime.now().isoformat(),
+            'created': 'Unknown'
+        }
+    except Exception as e:
+        return {
+            'stages': [],
+            'error': f"Unexpected error: {str(e)}",
+            'status': 'ERROR',
+            'updated': datetime.now().isoformat(),
+            'created': 'Unknown'
+        }
+
+def draw_loading_screen(stdscr, message):
+    """Draw a simple loading screen with error formatting"""
+    height, width = stdscr.getmaxyx()
+    stdscr.clear()
+    
+    # Draw border - avoid last column
+    stdscr.addstr(0, 0, "=" * (width-1))
+    stdscr.addstr(height-1, 0, "=" * (width-1))
+    
+    # Format multi-line messages
+    lines = message.split('\n')
+    start_row = (height - len(lines)) // 2
+    
+    for i, line in enumerate(lines):
+        if start_row + i < height - 1:  # Avoid bottom line
+            # Center each line, avoid last column
+            start_col = (width - len(line)) // 2
+            safe_line = line[:width-1]  # Truncate if too long
+            stdscr.addstr(start_row + i, start_col, safe_line)
+    
+    stdscr.refresh()
+
+def get_stage_status(stages, stage_name):
+    """Get status of a specific stage by name"""
+    for stage in stages:
+        if stage.get('stageName', '').lower() == stage_name.lower():
+            status = stage.get('latestExecution', {}).get('status', 'Unknown')
+            # Debug any status issues - uncomment if needed
+            # print(f"Found stage {stage_name}, status: {status}, data: {stage.get('latestExecution')}")
+            return status
+    return "N/A"
+
+def setup_colors():
+    """Initialize color pairs for the interface"""
+    # Check if terminal supports color
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        
+        # Define color pairs
+        # Color pairs are defined as: (pair_number, foreground, background)
+        curses.init_pair(1, curses.COLOR_GREEN, -1)    # Success
+        curses.init_pair(2, curses.COLOR_RED, -1)      # Error/Failed
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Warning
+        curses.init_pair(4, curses.COLOR_BLUE, -1)     # Info
+        curses.init_pair(5, curses.COLOR_CYAN, -1)     # Header
+        curses.init_pair(6, curses.COLOR_WHITE, -1)    # Default
+        curses.init_pair(7, 209, -1)                   # Orange (for InProgress)
+        
+        # Return color mapping
+        return {
+            'SUCCESS': curses.color_pair(1),
+            'ERROR': curses.color_pair(2),
+            'FAILED': curses.color_pair(2),
+            'WARNING': curses.color_pair(3),
+            'INPROGRESS': curses.color_pair(7) | curses.A_BLINK,  # Orange + blinking
+            'INFO': curses.color_pair(4),
+            'HEADER': curses.color_pair(5),
+            'DEFAULT': curses.color_pair(6)
+        }
+    return {}  # Return empty dict if colors not supported
+
+def get_status_color(status, colors):
+    """Get the appropriate color pair for a status"""
+    if not colors:
+        return 0
+        
+    status = status.upper() if status else ""
+    
+    if status == 'SUCCEEDED':
+        return colors['SUCCESS']
+    elif status == 'FAILED':
+        return colors['FAILED'] 
+    elif status == 'INPROGRESS':
+        return colors['INPROGRESS']  # This now has A_BLINK attribute too
+    elif status == 'ERROR':
+        return colors['ERROR']
+    else:
+        return colors.get('DEFAULT', 0)
+
+def draw_pipeline_status(stdscr, pipelines, states, selected_idx, scroll_offset=0, status_msg=None, operation_status=None, next_refresh=None, colors=None):
+    """Draw pipeline status screen with scrolling support"""
+    height, width = stdscr.getmaxyx()
+    stdscr.clear()
+    
+    # Define minimum column widths for stage status columns - add one space to each
+    min_source_width = 9  # Increased from 8
+    min_build_width = 9   # Increased from 8
+    min_deploy_width = 9  # Increased from 8
+    min_separators_width = 10  # " | " appears 3 times
+    
+    # Calculate available width for all columns
+    available_width = width - 1  # Leave 1 char for potential scrollbar
+    
+    # First, allocate minimum space for status columns and separators
+    min_required_width = min_source_width + min_build_width + min_deploy_width + min_separators_width
+    
+    # Determine pipeline name column width based on remaining space
+    pipeline_width = max(10, available_width - min_required_width)
+    
+    # If we have less width than required, reduce pipeline name width further
+    if available_width < min_required_width + 10:  # 10 is minimum desired pipeline name width
+        # Not enough width - use strict minimums and truncate pipeline name heavily if needed
+        source_width = min_source_width
+        build_width = min_build_width
+        deploy_width = min_deploy_width
+        pipeline_width = max(5, available_width - min_required_width)  # Ensure at least 5 chars for name
+    else:
+        # We have sufficient width
+        source_width = min_source_width
+        build_width = min_build_width
+        deploy_width = min_deploy_width
+        pipeline_width = available_width - min_required_width  # Give all extra space to pipeline name
+    
+    # Header with refresh timer
+    refresh_info = f" | Next refresh in {int(next_refresh)}s" if next_refresh else ""
+    header = f" CodePipeline Monitor | Updated: {datetime.now().strftime('%H:%M:%S')}{refresh_info} "
+    stdscr.addstr(0, 0, "=" * (width-1))
+    
+    if colors:
+        stdscr.attron(colors['HEADER'])
+    if len(header) < width:
+        stdscr.addstr(0, (width - len(header)) // 2, header)
+    if colors:
+        stdscr.attroff(colors['HEADER'])
+    
+    # Status message area - with boundary check
+    if status_msg and height > 2:
+        stdscr.attron(curses.A_BOLD)
+        msg = f" Status: {status_msg} "[:width-1]
+        stdscr.addstr(1, 0, msg)
+        stdscr.attroff(curses.A_BOLD)
+    
+    # Table header - adjust to fit available width with wider status columns
+    if height > 3:
+        header_line = f" {'Pipeline Name':<{pipeline_width}} | {'Source':<{source_width}} | {'Build':<{build_width}} | {'Deploy':<{deploy_width}}"
+        if colors:
+            stdscr.attron(colors['HEADER'] | curses.A_BOLD)
+        else:
+            stdscr.attron(curses.A_BOLD)
+            
+        stdscr.addstr(2, 0, header_line[:width-1])
+        
+        if colors:
+            stdscr.attroff(colors['HEADER'] | curses.A_BOLD)
+        else:
+            stdscr.attroff(curses.A_BOLD)
+            
+        stdscr.addstr(3, 0, "-" * (width-1))
+    
+    # Calculate visible pipelines accounting for scroll
+    list_height = height - 6  # Reserve space for headers, footer and status lines
+    scroll_max = max(0, len(pipelines) - list_height)
+    
+    # Adjust scroll offset to keep selected item visible
+    if selected_idx < scroll_offset:
+        scroll_offset = selected_idx
+    elif selected_idx >= scroll_offset + list_height:
+        scroll_offset = selected_idx - list_height + 1
+    
+    # Cap scroll offset
+    scroll_offset = max(0, min(scroll_max, scroll_offset))
+    
+    # Show scrollbar if needed
+    if len(pipelines) > list_height:
+        # Calculate scrollbar metrics
+        scrollbar_height = max(3, int(list_height * list_height / len(pipelines)))
+        scrollbar_pos = min(list_height - scrollbar_height, 
+                          int(scroll_offset * list_height / len(pipelines)))
+        
+        # Draw scrollbar
+        for i in range(list_height):
+            is_thumb = i >= scrollbar_pos and i < scrollbar_pos + scrollbar_height
+            stdscr.addstr(i + 4, width - 1, "█" if is_thumb else "│")
+    
+    # Pipeline list as table - only the visible portion
+    visible_pipelines = pipelines[scroll_offset:scroll_offset + list_height]
+    
+    for idx, pipeline in enumerate(visible_pipelines):
+        row_pos = idx + 4  # Start after table header and separator
+        actual_idx = idx + scroll_offset  # Actual index in the full pipelines list
+        name = pipeline['name']
+        orig_name = name  # Store original name for state lookup
+        
+        # Always truncate name to pipeline_width to ensure proper formatting
+        if len(name) > pipeline_width:
+            name = name[:max(0, pipeline_width-3)] + "..."
+        else:
+            # Pad name to full width for proper alignment
+            name = name.ljust(pipeline_width)
+        
+        # Apply highlight if selected
+        if actual_idx == selected_idx:
+            stdscr.attron(curses.A_REVERSE)
+        
+        # Get cached state or show loading - use original name for lookup
+        state = states.get(orig_name, {
+            'stages': [], 
+            'error': None,
+            'status': 'Loading...',
+            'updated': datetime.now().isoformat(),
+            'created': 'Unknown'
+        })
+        
+        # If there's an error, show it in all columns
+        if state.get('error'):
+            col1 = "ERROR"
+            col2 = "ERROR"
+            col3 = "ERROR"
+        elif not state.get('stages'):
+            col1 = "Loading"
+            col2 = "Loading"
+            col3 = "Loading"
+        else:
+            # Extract status for each standard stage
+            col1 = get_stage_status(state['stages'], "source")
+            col2 = get_stage_status(state['stages'], "build")
+            col3 = get_stage_status(state['stages'], "deploy")
+            
+            # Try common stage name variations
+            if col1 == "N/A":
+                for alt_name in ["Source", "checkout", "Checkout"]:
+                    col1 = get_stage_status(state['stages'], alt_name)
+                    if col1 != "N/A":
+                        break
+                        
+            if col2 == "N/A":
+                for alt_name in ["Build", "compile", "Compile", "Test", "test"]:
+                    col2 = get_stage_status(state['stages'], alt_name)
+                    if col2 != "N/A":
+                        break
+                        
+            if col3 == "N/A":
+                for alt_name in ["Deploy", "deployment", "Deployment", "Production"]:
+                    col3 = get_stage_status(state['stages'], alt_name)
+                    if col3 != "N/A":
+                        break
+        
+        try:
+            # Draw name column with exact width
+            stdscr.addstr(row_pos, 0, f" {name[:pipeline_width]} ")
+            
+            # Add separators and status columns with precise positioning
+            col_pos = pipeline_width + 2  # Starting position after name column plus space
+            
+            # Source column
+            stdscr.addstr(row_pos, col_pos, "| ")
+            col_pos += 2
+            
+            if colors:
+                stdscr.attron(get_status_color(col1, colors))
+            stdscr.addstr(row_pos, col_pos, f"{col1:<{source_width}}")
+            if colors:
+                stdscr.attroff(get_status_color(col1, colors))
+            col_pos += source_width
+            
+            # Build column
+            stdscr.addstr(row_pos, col_pos, " | ")
+            col_pos += 3
+            
+            if colors:
+                stdscr.attron(get_status_color(col2, colors))
+            stdscr.addstr(row_pos, col_pos, f"{col2:<{build_width}}")
+            if colors:
+                stdscr.attroff(get_status_color(col2, colors))
+            col_pos += build_width
+            
+            # Deploy column
+            stdscr.addstr(row_pos, col_pos, " | ")
+            col_pos += 3
+            
+            if colors:
+                stdscr.attron(get_status_color(col3, colors))
+            stdscr.addstr(row_pos, col_pos, f"{col3:<{deploy_width}}")
+            if colors:
+                stdscr.attroff(get_status_color(col3, colors))
+        except curses.error:
+            # Handle potential curses errors from drawing beyond screen boundaries
+            pass
+            
+        # Turn off highlight
+        if actual_idx == selected_idx:
+            stdscr.attroff(curses.A_REVERSE)
+    
+    # Details for selected pipeline
+    if selected_idx < len(pipelines) and height > 5:
+        # Use original full name for details
+        name = pipelines[selected_idx]['name']
+        state = states.get(name, {})
+        
+        if state.get('error'):
+            details = f" Error: {state['error']}"
+        else:
+            details = f" Last Updated: {state.get('updated', 'Unknown')} | Created: {state.get('created', 'Unknown')}"
+        
+        stdscr.addstr(height-2, 0, details[:width-1])
+    
+    # Footer with help - ensure it fits on screen
+    if height > 1:
+        if width < 80:  # For narrow screens, use shorter help text
+            footer = "q:Quit | ↑↓:Nav | r:Refresh | f:Filter | Enter:View"
+        else:
+            footer = "q:Quit | ↑↓:Navigate | PgUp/PgDn:Scroll | r:Refresh | f:Filter | Return:View Details"
+        
+        footer = footer[:width-2]  # Leave space for scrollbar
+        stdscr.addstr(height-1, 0, footer)
+    
+    # Operation status line - avoid last column and check height
+    if operation_status and height > 2:
+        status_line = f"Status: {operation_status}"[:width-1]
+        stdscr.addstr(height-2, 0, status_line)
+    
+    # Show scroll position if scrolling with proper positioning for narrow screens
+    if len(pipelines) > list_height:
+        scroll_info = f"{scroll_offset+1}-{min(scroll_offset+list_height, len(pipelines))}/{len(pipelines)}"
+        info_len = len(scroll_info)
+        
+        # Make sure we have space for the scroll info
+        if width > info_len + 1:
+            stdscr.addstr(height-1, width - info_len - 1, scroll_info)
+    
+    stdscr.refresh()
+    return scroll_offset  # Return the new scroll offset
+
+def format_timestamp(timestamp_str):
+    """Format a timestamp string to a more readable format"""
+    if not timestamp_str or timestamp_str == 'Unknown':
+        return 'Unknown'
+        
+    try:
+        # Try to parse and format ISO timestamp if available
+        if 'T' in timestamp_str:
+            # Parse ISO 8601 format
+            dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        pass
+        
+    # Return original if parsing failed
+    return timestamp_str
+
+def show_pipeline_details(stdscr, pipeline_name, state, colors=None):
+    """Show detailed view of a pipeline"""
+    height, width = stdscr.getmaxyx()
+    stdscr.clear()
+    
+    # Disable timeout for detail view
+    stdscr.timeout(-1)  # Wait indefinitely for user input
+    
+    # Header
+    title = f" Pipeline Details: {pipeline_name} "
+    stdscr.addstr(0, 0, "=" * (width-1))
+    
+    if colors:
+        stdscr.attron(colors['HEADER'])
+    stdscr.addstr(0, (width - len(title)) // 2, title)
+    if colors:
+        stdscr.attroff(colors['HEADER'])
+    
+    # Basic pipeline info
+    stdscr.addstr(2, 2, f"Status: {state.get('status', 'Unknown')}")
+    stdscr.addstr(3, 2, f"Updated: {format_timestamp(state.get('updated', 'Unknown'))}")
+    stdscr.addstr(4, 2, f"Created: {format_timestamp(state.get('created', 'Unknown'))}")
+    
+    # Add execution details if available
+    row = 4
+    if 'lastStartTime' in state:
+        last_time = format_timestamp(state.get('lastStartTime', 'Unknown'))
+        stdscr.addstr(row, 2, f"Last Execution: {last_time}")
+        row += 1
+        
+    if 'lastStatus' in state:
+        status = state.get('lastStatus', 'Unknown')
+        stdscr.addstr(row, 2, f"Last Status: ", curses.A_BOLD)
+        
+        # Color the status
+        if colors:
+            if status == 'Succeeded':
+                stdscr.attron(colors['SUCCESS'])
+            elif status == 'Failed':
+                stdscr.attron(colors['FAILED'])
+            elif status == 'InProgress':
+                stdscr.attron(colors['INPROGRESS'])
+        
+        stdscr.addstr(status)
+        
+        # Reset color
+        if colors:
+            if status == 'Succeeded':
+                stdscr.attroff(colors['SUCCESS'])
+            elif status == 'Failed':
+                stdscr.attroff(colors['FAILED'])
+            elif status == 'InProgress':
+                stdscr.attroff(colors['INPROGRESS'])
+                
+        row += 1
+    
+    if 'lastDuration' in state:
+        stdscr.addstr(row, 2, f"Duration: {state.get('lastDuration', 'Unknown')}")
+        row += 1
+        
+    if 'lastTriggerType' in state:
+        stdscr.addstr(row, 2, f"Trigger: {state.get('lastTriggerType', 'Unknown')}")
+        row += 1
+        
+    if 'lastTriggerDetail' in state:
+        stdscr.addstr(row, 2, f"Trigger Detail: {state.get('lastTriggerDetail', '')}")
+        row += 1
+        
+    # Add commit info if available
+    if 'commitInfo' in state:
+        commit_info = state['commitInfo']
+        row += 1
+        stdscr.addstr(row, 2, "Commit Information:", curses.A_BOLD)
+        row += 1
+        
+        if 'revisionId' in commit_info and commit_info['revisionId']:
+            rev_id = commit_info['revisionId']
+            # For Git commit IDs, show just the first part
+            if len(rev_id) > 8:
+                rev_id = rev_id[:8] + "..."
+            stdscr.addstr(row, 4, f"Commit: {rev_id}")
+            row += 1
+            
+        if 'revisionAuthor' in commit_info and commit_info['revisionAuthor']:
+            stdscr.addstr(row, 4, f"Author: {commit_info['revisionAuthor']}")
+            row += 1
+            
+        if 'revisionSummary' in commit_info and commit_info['revisionSummary']:
+            # Wrap the commit message if it's too long
+            msg = commit_info['revisionSummary']
+            if len(msg) > width - 12:
+                msg = msg[:width-15] + "..."
+            stdscr.addstr(row, 4, f"Message: {msg}")
+            row += 1
+    
+    # Stage details - enhanced with action information
+    row += 1
+    stdscr.addstr(row, 0, " Stages: ")
+    stdscr.addstr(row + 1, 0, "-" * (width-1))
+    
+    row += 2  # Start stages section after header
+    
+    if state.get('error'):
+        stdscr.attron(curses.A_BOLD)
+        stdscr.addstr(row, 2, f"ERROR: {state['error']}")
+        stdscr.attroff(curses.A_BOLD)
+        row += 2
+    elif not state.get('stages'):
+        stdscr.addstr(row, 2, "No stage information available")
+        row += 1
+    else:
+        for i, stage in enumerate(state.get('stages', [])):
+            if row >= height - 3:  # Leave space for footer
+                break
+                
+            stage_name = stage.get('stageName', 'Unknown stage')
+            exec_info = stage.get('latestExecution', {})
+            status = exec_info.get('status', 'Unknown')
+            last_update = format_timestamp(exec_info.get('lastUpdateTime', 'Unknown'))
+            
+            # Stage header with name and status
+            stdscr.attron(curses.A_BOLD)
+            stdscr.addstr(row, 2, f"Stage {i+1}: {stage_name}")
+            stdscr.attroff(curses.A_BOLD)
+            row += 1
+            
+            # Display status with appropriate color and last update time
+            stdscr.addstr(row, 4, f"Status: ")
+            if colors:
+                if status == 'Succeeded':
+                    stdscr.attron(colors['SUCCESS'])
+                    stdscr.addstr(f"{status}")
+                    stdscr.attroff(colors['SUCCESS'])
+                elif status == 'Failed':
+                    stdscr.attron(colors['FAILED'])
+                    stdscr.addstr(f"{status}")
+                    stdscr.attroff(colors['FAILED'])
+                elif status == 'InProgress':
+                    stdscr.attron(colors['INPROGRESS'])
+                    stdscr.addstr(f"{status}")
+                    stdscr.attroff(colors['INPROGRESS'])
+                else:
+                    stdscr.addstr(f"{status}")
+            else:
+                stdscr.addstr(f"{status}")
+                
+            stdscr.addstr(f" (Updated: {last_update})")
+            row += 1
+            
+            # Show actions if available
+            actions = exec_info.get('actions', [])
+            if actions:
+                for j, action in enumerate(actions):
+                    if row >= height - 3: break
+                    
+                    action_name = action.get('name', 'Unknown action')
+                    action_status = action.get('status', 'Unknown')
+                    action_time = format_timestamp(action.get('lastUpdate', 'Unknown'))
+                    
+                    # Format each action with status and time
+                    stdscr.addstr(row, 6, f"• {action_name}: ")
+                    
+                    # Color the action status
+                    if colors:
+                        if action_status == 'Succeeded':
+                            stdscr.attron(colors['SUCCESS'])
+                            stdscr.addstr(f"{action_status}")
+                            stdscr.attroff(colors['SUCCESS'])
+                        elif action_status == 'Failed':
+                            stdscr.attron(colors['FAILED'])
+                            stdscr.addstr(f"{action_status}")
+                            stdscr.attroff(colors['FAILED'])
+                        elif action_status == 'InProgress':
+                            stdscr.attron(colors['INPROGRESS'])
+                            stdscr.addstr(f"{action_status}")
+                            stdscr.attroff(colors['INPROGRESS'])
+                        else:
+                            stdscr.addstr(f"{action_status}")
+                    else:
+                        stdscr.addstr(f"{action_status}")
+                    
+                    # Show last update time if available
+                    if action_time and action_time != 'Unknown':
+                        stdscr.addstr(f" ({action_time})")
+                    
+                    row += 1
+                    
+                    # Show error details if action failed
+                    error_msg = action.get('error')
+                    if error_msg and action_status == 'Failed':
+                        if row >= height - 3: break
+                        
+                        # Wrap long error messages
+                        if len(error_msg) > width - 12:
+                            error_msg = error_msg[:width-15] + "..."
+                            
+                        stdscr.attron(curses.A_BOLD)
+                        stdscr.addstr(row, 8, f"Error: {error_msg}")
+                        stdscr.attroff(curses.A_BOLD)
+                        row += 1
+            
+            # Show general error details for failed stages
+            if status == 'Failed' and 'errorDetails' in exec_info and not actions:
+                error_msg = exec_info['errorDetails'].get('message', 'Unknown error')
+                stdscr.attron(curses.A_BOLD)
+                stdscr.addstr(row, 4, f"Error: {error_msg[:width-10]}")  # Truncate if necessary
+                stdscr.attroff(curses.A_BOLD)
+                row += 1
+            
+            row += 1  # Space between stages
+    
+    # Add execution history section if available
+    if 'executions' in state and state['executions']:
+        executions = state['executions']
+        
+        # Check if we have room to display at least some execution history
+        if row + 3 < height - 3:  # Need at least 3 rows: header, separator, and 1 execution
+            stdscr.addstr(row, 0, " Execution History: ")
+            stdscr.addstr(row + 1, 0, "-" * (width-1))
+            row += 2
+            
+            # Show up to 5 recent executions
+            for i, execution in enumerate(executions[:5]):
+                if row >= height - 3:  # Leave space for footer
+                    break
+                    
+                status = execution.get('status', 'Unknown')
+                start_time = format_timestamp(execution.get('startTime', 'Unknown'))
+                
+                # Format the execution line
+                exec_line = f"{i+1}. {start_time} - Status: "
+                stdscr.addstr(row, 2, exec_line)
+                
+                # Add colored status
+                if colors:
+                    if status == 'Succeeded':
+                        stdscr.attron(colors['SUCCESS'])
+                    elif status == 'Failed':
+                        stdscr.attron(colors['FAILED'])
+                    elif status == 'InProgress':
+                        stdscr.attron(colors['INPROGRESS'])
+                
+                stdscr.addstr(status)
+                
+                # Reset color
+                if colors:
+                    if status == 'Succeeded':
+                        stdscr.attroff(colors['SUCCESS'])
+                    elif status == 'Failed':
+                        stdscr.attroff(colors['FAILED'])
+                    elif status == 'InProgress':
+                        stdscr.attroff(colors['INPROGRESS'])
+                
+                row += 1
+    
+    # Footer
+    stdscr.addstr(height-1, 0, "Press any key to return to main view")
+    stdscr.refresh()
+    stdscr.getch()  # Wait for keypress
+    
+    # Reset timeout before returning to main view
+    stdscr.timeout(1000)
+
+def draw_no_pipelines_screen(stdscr, filter_pattern, colors=None):
+    """Draw screen when no pipelines match the filter"""
+    height, width = stdscr.getmaxyx()
+    stdscr.clear()
+    
+    # Draw header
+    header = " CodePipeline Monitor "
+    stdscr.addstr(0, 0, "=" * (width-1))
+    
+    if colors:
+        stdscr.attron(colors['HEADER'])
+    stdscr.addstr(0, (width - len(header)) // 2, header)
+    if colors:
+        stdscr.attroff(colors['HEADER'])
+    
+    # Draw message
+    message_lines = [
+        f"No pipelines match the current filter: '{filter_pattern}'",
+        "",
+        "Press 'f' to change the filter pattern",
+        "Press 'r' to refresh with current filter",
+        "Press 'q' to quit"
+    ]
+    
+    start_row = (height - len(message_lines)) // 2
+    
+    for i, line in enumerate(message_lines):
+        if start_row + i < height - 1:
+            if i == 0 and colors:
+                stdscr.attron(colors['WARNING'] | curses.A_BOLD)
+            
+            stdscr.addstr(start_row + i, (width - len(line)) // 2, line)
+            
+            if i == 0 and colors:
+                stdscr.attroff(colors['WARNING'] | curses.A_BOLD)
+    
+    # Footer
+    footer = "q:Quit | r:Refresh | f:Filter"
+    stdscr.addstr(height-1, 0, footer[:width-1])
+    
+    stdscr.refresh()
+
+class PipelineMonitor:
+    def __init__(self):
+        self.states = {}
+        self.update_queue = queue.Queue()
+        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.last_refresh = time.time()
+        self.refresh_interval = 30  # seconds
+        self.priority_refresh_interval = 10  # seconds for active pipelines
+        self.is_running = True
+        self.pipelines = []
+        self.initialized = False
+        self.config = load_config()
+        self.refresh_interval = self.config.get('refresh_interval', 30)
+        # Track pipelines that need priority refresh (those in InProgress)
+        self.priority_pipelines = set()
+        self.last_priority_refresh = 0
+
+    def start_background_refresh(self):
+        """Start background refresh thread"""
+        def refresh_worker():
+            while self.is_running:
+                try:
+                    current_time = time.time()
+                    
+                    # Initial setup - fetch pipelines first
+                    if not self.initialized:
+                        self.update_queue.put(('status', "Initializing... fetching pipeline list"))
+                        self.pipelines = get_pipelines()
+                        
+                        # Still initialize even if no pipelines found
+                        self.update_queue.put(('pipelines', self.pipelines))
+                        if not self.pipelines:
+                            self.update_queue.put(('no_pipelines', self.config.get('pipeline_filter', '*')))
+                        else:
+                            self.update_queue.put(('status', f"Found {len(self.pipelines)} pipelines"))
+                            # Fetch states only if pipelines exist
+                            self.refresh_states(is_initial=True)
+                        
+                        self.initialized = True
+                        self.last_refresh = time.time()
+                    
+                    # Check if we need to refresh priority pipelines
+                    elif self.priority_pipelines and current_time - self.last_priority_refresh >= self.priority_refresh_interval:
+                        self.refresh_priority_pipelines()
+                        self.last_priority_refresh = current_time
+                    
+                    # Regular refresh cycle for all pipelines
+                    elif current_time - self.last_refresh >= self.refresh_interval:
+                        new_pipelines = get_pipelines()
+                        # Update pipeline list regardless of whether it's empty
+                        self.pipelines = new_pipelines
+                        self.update_queue.put(('pipelines', self.pipelines))
+                        
+                        if not self.pipelines:
+                            self.update_queue.put(('no_pipelines', self.config.get('pipeline_filter', '*')))
+                        else:
+                            # Only refresh states if pipelines exist
+                            self.refresh_states(is_initial=False)
+                            
+                        self.last_refresh = current_time
+                        
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    self.update_queue.put(('error', f"Refresh thread error: {str(e)}"))
+                    time.sleep(1)
+
+        thread = threading.Thread(target=refresh_worker, daemon=True)
+        thread.start()
+        return thread
+
+    def refresh_priority_pipelines(self):
+        """Refresh only pipelines that are in InProgress status"""
+        if not self.priority_pipelines:
+            return
+
+        self.update_queue.put(('status', f"Refreshing {len(self.priority_pipelines)} active pipelines..."))
+        
+        # Create a list of pipeline objects for priority pipelines
+        priority_pipeline_objects = []
+        for pipeline in self.pipelines:
+            if pipeline['name'] in self.priority_pipelines:
+                priority_pipeline_objects.append(pipeline)
+                
+        if not priority_pipeline_objects:
+            return
+            
+        def fetch_priority_state(pipeline):
+            try:
+                name = pipeline['name']
+                state = get_pipeline_state(name)
+                
+                # Check if this pipeline has completed and should be removed from priority list
+                is_complete = False
+                if state and isinstance(state, dict) and state.get('stages'):
+                    # Check if all stages are complete
+                    all_stages_complete = True
+                    for stage in state['stages']:
+                        status = stage.get('latestExecution', {}).get('status', '').upper()
+                        if status == 'INPROGRESS':
+                            all_stages_complete = False
+                            break
+                    
+                    if all_stages_complete:
+                        is_complete = True
+                        # Remove from priority list if complete
+                        self.priority_pipelines.discard(name)
+                
+                # Update the state
+                self.update_queue.put(('state', (name, state)))
+                
+                # Update UI with completion status
+                if is_complete:
+                    self.update_queue.put(('status', f"Pipeline {name} completed"))
+                    
+            except Exception as e:
+                self.update_queue.put(('error', f"Error fetching priority pipeline {name}: {str(e)}"))
+                # If we can't fetch the state, remove from priority to avoid constant retries
+                self.priority_pipelines.discard(name)
+        
+        # Submit all priority pipeline tasks to the executor
+        for pipeline in priority_pipeline_objects:
+            self.executor.submit(fetch_priority_state, pipeline)
+            
+        self.update_queue.put(('status', f"Refreshing {len(priority_pipeline_objects)} active pipelines..."))
+
+    def refresh_states(self, is_initial=False):
+        """Refresh all pipeline states"""
+        try:
+            # Get fresh pipeline list for normal refresh cycles
+            if not is_initial:
+                new_pipelines = get_pipelines()
+                if new_pipelines:
+                    self.pipelines = new_pipelines
+                    self.update_queue.put(('pipelines', self.pipelines))
+                else:
+                    self.update_queue.put(('error', "No pipelines found during refresh"))
+                    return
+                    
+            self.update_queue.put(('status', f"Refreshing {len(self.pipelines)} pipelines..."))
+            
+            def fetch_state(pipeline):
+                try:
+                    name = pipeline['name']
+                    state = get_pipeline_state(name)
+                    
+                    # Verify we got valid state data
+                    if not state or not isinstance(state, dict):
+                        self.update_queue.put(('error', f"Invalid state returned for {name}"))
+                        self.priority_pipelines.discard(name)  # Remove from priority if invalid
+                    elif not state.get('stages'):
+                        if not state.get('error'):
+                            self.update_queue.put(('error', f"No stages found for {name}"))
+                        self.priority_pipelines.discard(name)  # Remove from priority if no stages
+                    else:
+                        # Valid state with stages
+                        self.update_queue.put(('state', (name, state)))
+                        
+                        # Check if any stage is in progress - if so, add to priority list
+                        has_in_progress = False
+                        for stage in state['stages']:
+                            status = stage.get('latestExecution', {}).get('status', '').upper()
+                            if status == 'INPROGRESS':
+                                has_in_progress = True
+                                break
+                                
+                        if has_in_progress:
+                            self.priority_pipelines.add(name)
+                        else:
+                            self.priority_pipelines.discard(name)
+                    
+                except Exception as e:
+                    self.update_queue.put(('error', f"Error fetching {name}: {str(e)}"))
+                    self.priority_pipelines.discard(name)  # Remove from priority on error
+                finally:
+                    # Always update status to show progress
+                    self.update_queue.put(('progress', name))
+            
+            # Submit all pipeline refresh tasks to the executor
+            submitted = 0
+            for pipeline in self.pipelines:
+                self.executor.submit(fetch_state, pipeline)
+                submitted += 1
+                
+            self.update_queue.put(('status', f"Submitted {submitted} pipeline updates"))
+        except Exception as e:
+            self.update_queue.put(('error', f"Refresh error: {str(e)}"))
+
+    def update_filter(self, new_filter):
+        """Update filter pattern and trigger refresh"""
+        if new_filter and new_filter != self.config.get('pipeline_filter'):
+            self.config = update_config(new_filter=new_filter)
+            self.initialized = False  # Force re-initialization with new filter
+            self.states = {}  # Clear existing states
+            self.pipelines = []  # Clear existing pipelines
+            
+            # Immediately fetch new pipeline list with the new filter
+            self.update_queue.put(('status', f"Applying new filter: {new_filter}"))
+            try:
+                new_pipelines = get_pipelines()
+                self.pipelines = new_pipelines  # Always update pipelines list
+                self.update_queue.put(('pipelines', self.pipelines))
+                
+                if not new_pipelines:
+                    # Signal that no pipelines match the filter
+                    self.update_queue.put(('no_pipelines', new_filter))
+                else:
+                    self.update_queue.put(('status', f"Found {len(new_pipelines)} pipelines with filter: {new_filter}"))
+            except Exception as e:
+                self.update_queue.put(('error', f"Error applying filter: {str(e)}"))
+                
+            # Force immediate refresh
+            self.last_refresh = 0
+            return True
+        return False
+
+def main(stdscr):
+    # Setup
+    curses.curs_set(0)
+    curses.use_default_colors()
+    selected_idx = 0
+    scroll_offset = 0  # Track current scroll position
+    status_msg = "Initializing..."
+    operation_status = "Starting up..."
+    pipelines = []
+    processed_count = 0
+    
+    monitor = PipelineMonitor()
+    refresh_thread = monitor.start_background_refresh()
+    
+    colors = setup_colors()  # Initialize colors
+    
+    # New state variable to track empty pipeline state
+    no_pipelines_filter = None
+    
+    # Debug flag - set to True to enable debugging to file
+    debug_mode = False
+    if debug_mode:
+        debug_file = open('/tmp/cp-monitor-debug.log', 'w')
+    
+    try:
+        # Show initial loading screen
+        draw_loading_screen(stdscr, f"Initializing AWS CodePipeline Monitor...\n"
+                                  f"Loading data in background...\n"
+                                  f"Please wait...")
+        
+        # Main UI loop starts immediately - no blocking operations
+        while True:
+            # Process any pending updates from background thread
+            update_count = 0
+            while not monitor.update_queue.empty():
+                update_count += 1
+                update_type, data = monitor.update_queue.get_nowait()
+                
+                if update_type == 'state':
+                    pipeline_name, state = data
+                    if debug_mode:
+                        debug_file.write(f"Got state for {pipeline_name}: {state}\n")
+                        debug_file.flush()
+                    monitor.states[pipeline_name] = state
+                elif update_type == 'pipelines':
+                    pipelines = data
+                    # Reset no_pipelines_filter if we got pipelines
+                    if pipelines:
+                        no_pipelines_filter = None
+                    # Reset selection if the list changed
+                    if selected_idx >= len(pipelines):
+                        selected_idx = 0
+                elif update_type == 'error':
+                    status_msg = f"Error: {data}"
+                elif update_type == 'status':
+                    operation_status = data
+                elif update_type == 'progress':
+                    processed_count += 1
+                    operation_status = f"Processed {processed_count}/{len(pipelines)} pipelines"
+                elif update_type == 'no_pipelines':
+                    no_pipelines_filter = data  # Store the filter that returned no results
+                    status_msg = f"No pipelines match filter: '{data}'"
+
+            # Calculate time until next refresh - show priority refresh if applicable
+            if pipelines and monitor.priority_pipelines:
+                next_refresh = min(
+                    monitor.refresh_interval - (time.time() - monitor.last_refresh),
+                    monitor.priority_refresh_interval - (time.time() - monitor.last_priority_refresh)
+                )
+            else:
+                next_refresh = monitor.refresh_interval - (time.time() - monitor.last_refresh)
+                
+            if next_refresh < 0:
+                next_refresh = 0
+            
+            # Draw the appropriate screen based on pipeline state
+            if pipelines:
+                # We have pipelines - draw normal screen
+                no_pipelines_filter = None  # Clear no pipelines state
+                
+                # Draw screen and get updated scroll offset
+                scroll_offset = draw_pipeline_status(
+                    stdscr, pipelines, monitor.states, selected_idx, 
+                    scroll_offset, status_msg, operation_status, next_refresh, colors
+                )
+                
+            elif no_pipelines_filter:
+                # We specifically know there are no matching pipelines - show special screen
+                draw_no_pipelines_screen(stdscr, no_pipelines_filter, colors)
+            else:
+                # If no pipelines yet, keep showing the loading screen
+                if update_count > 0:  # Only redraw if we had updates
+                    draw_loading_screen(stdscr, f"Initializing AWS CodePipeline Monitor...\n"
+                                             f"{operation_status}\n"
+                                             f"{status_msg}")
+            
+            status_msg = None  # Clear status message after display
+            
+            # Handle input with short timeout for responsive UI
+            stdscr.timeout(100)  # Short timeout for smooth updates
+            key = stdscr.getch()
+            
+            if key == ord('q'):
+                break
+            elif key == ord('r'):
+                operation_status = "Manual refresh triggered..."
+                status_msg = "Refreshing all pipelines..."
+                # Force immediate refresh
+                monitor.states = {}
+                monitor.last_refresh = 0
+                processed_count = 0
+                no_pipelines_filter = None  # Reset no pipelines state
+                continue
+            elif key == ord('f'):
+                # Get current filter (whether there are pipelines or not)
+                current_filter = monitor.config.get('pipeline_filter', '*')
+                new_filter = show_filter_prompt(stdscr, current_filter)
+                
+                if new_filter and new_filter != current_filter:
+                    status_msg = f"Changing filter to: {new_filter}"
+                    operation_status = "Updating filter and refreshing..."
+                    processed_count = 0
+                    pipelines = []  # Clear current pipeline list to show loading state
+                    monitor.states = {}  # Clear states
+                    
+                    # Update filter in monitor - this now does immediate refresh
+                    if monitor.update_filter(new_filter):
+                        # Show the user that we're working on it
+                        draw_loading_screen(stdscr, f"Filter changed to: {new_filter}\n"
+                                                 f"Refreshing pipeline list...\n"
+                                                 f"Please wait...")
+                        
+                        # Wait a moment to ensure the UI shows the loading screen
+                        time.sleep(0.5)
+                continue
+            elif key == 10 or key == 13 and pipelines:  # Handle Return/Enter key only if we have pipelines
+                if selected_idx < len(pipelines):
+                    name = pipelines[selected_idx]['name']
+                    
+                    # First make sure we have state data
+                    if name not in monitor.states:
+                        status_msg = f"No data for {name} yet, please wait..."
+                        continue
+                    
+                    # Show detailed view - will wait for user keypress
+                    show_pipeline_details(stdscr, name, monitor.states[name], colors)
+                continue
+            elif key == curses.KEY_UP:
+                if selected_idx > 0:
+                    selected_idx -= 1
+            elif key == curses.KEY_DOWN:
+                if pipelines and selected_idx < len(pipelines) - 1:
+                    selected_idx += 1
+            elif key == curses.KEY_PPAGE:  # Page Up
+                # Move selection up by a page
+                list_height = curses.LINES - 6
+                selected_idx = max(0, selected_idx - list_height)
+            elif key == curses.KEY_NPAGE:  # Page Down
+                # Move selection down by a page
+                list_height = curses.LINES - 6
+                if pipelines:
+                    selected_idx = min(len(pipelines) - 1, selected_idx + list_height)
+            elif key == ord('j'):  # Vim-style down
+                if pipelines and selected_idx < len(pipelines) - 1:
+                    selected_idx += 1
+            elif key == ord('k'):  # Vim-style up
+                if selected_idx > 0:
+                    selected_idx -= 1
+            elif key == -1:  # Timeout
+                continue
+            
+    except Exception as e:
+        error_msg = f"Error: {type(e).__name__}\n\n{str(e)}\n\nPress any key to exit."
+        draw_loading_screen(stdscr, error_msg)
+        stdscr.getch()
+    finally:
+        monitor.is_running = False
+        refresh_thread.join(timeout=1)
+        monitor.executor.shutdown(wait=False)
+
+if __name__ == "__main__":
+    curses.wrapper(main)

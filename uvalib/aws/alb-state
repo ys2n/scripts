@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+
+#
+# Favorites dashboard — called when script is invoked with no arguments.
+# Makes live AWS calls per favorite; groups by profile to minimize vault prompts.
+#
+show_favorites() {
+  local PROFILE_FILTER="${1:-}"
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "No config.json found at $CONFIG_FILE"
+    echo "Create one with a 'favorites' section, or run '$0 <profile> --discover' to find pools."
+    return
+  fi
+
+  local JQ_FILTER
+  if [[ -n "$PROFILE_FILTER" ]]; then
+    JQ_FILTER='.favorites | to_entries[] | select(.value.profile == $prof) | [.key, .value.profile, .value.target_group] | @tsv'
+  else
+    JQ_FILTER='.favorites | to_entries[] | [.key, .value.profile, .value.target_group] | @tsv'
+  fi
+
+  local FAV_LIST
+  FAV_LIST="$(jq -r --arg prof "$PROFILE_FILTER" "$JQ_FILTER" "$CONFIG_FILE" 2>/dev/null)"
+
+  if [[ -z "$FAV_LIST" ]]; then
+    if [[ -n "$PROFILE_FILTER" ]]; then
+      echo "No favorites configured for profile '$PROFILE_FILTER'."
+    else
+      echo "No favorites configured in $CONFIG_FILE"
+    fi
+    echo "Run '$0 <profile> --discover' to find pools."
+    return
+  fi
+
+  local HEADER="FAVORITES  $(date '+%H:%M:%S')"
+  [[ -n "$PROFILE_FILTER" ]] && HEADER="FAVORITES [$PROFILE_FILTER]  $(date '+%H:%M:%S')"
+
+  echo
+  echo "============================================================"
+  echo " $HEADER"
+  echo "============================================================"
+  echo
+  printf "%-20s %-12s %-45s %s\n" "NAME" "PROFILE" "TARGET GROUP" "HEALTH"
+  echo "---------------------------------------------------------------------------------------------------"
+
+  while IFS=$'\t' read -r NAME PROF TG; do
+    local TG_ARN HEALTH TOTAL HEALTHY STATE
+    TG_ARN="$(aws-vault exec "$PROF" -- aws elbv2 describe-target-groups \
+      --names "$TG" \
+      --query 'TargetGroups[0].TargetGroupArn' \
+      --output text 2>/dev/null || echo "None")"
+
+    if [[ -z "$TG_ARN" || "$TG_ARN" == "None" ]]; then
+      printf "%-20s %-12s %-45s %s\n" "$NAME" "$PROF" "$TG" "(not found)"
+      continue
+    fi
+
+    HEALTH="$(aws-vault exec "$PROF" -- aws elbv2 describe-target-health \
+      --target-group-arn "$TG_ARN" \
+      --query 'TargetHealthDescriptions[*].TargetHealth.State' \
+      --output text 2>/dev/null || echo "")"
+
+    TOTAL=0; HEALTHY=0
+    for STATE in $HEALTH; do
+      (( TOTAL++ )) || true
+      [[ "$STATE" == "healthy" ]] && (( HEALTHY++ )) || true
+    done
+
+    printf "%-20s %-12s %-45s %d/%d healthy\n" "$NAME" "$PROF" "$TG" "$HEALTHY" "$TOTAL"
+  done <<< "$FAV_LIST"
+
+  echo
+  echo "Run '$0 <name> [options]' to manage a pool, or '$0 <profile> --discover' to find others."
+}
+
+#
+# List all ALB target groups for the current profile; annotates configured favorites.
+# Requires $AWS and $PROFILE to be set.
+#
+do_discover() {
+  local HEADER="AVAILABLE TARGET GROUPS ($PROFILE)"
+  [[ -n "$DISCOVER_FILTER" ]] && HEADER="$HEADER  [filter: $DISCOVER_FILTER]"
+
+  echo
+  echo "============================================================"
+  echo " $HEADER"
+  echo "============================================================"
+  echo
+  printf "%-50s %s\n" "TARGET GROUP NAME" "NOTE"
+  echo "-----------------------------------------------------------------------"
+
+  local ALL_GROUPS TG_NAME NOTE FAV_NAME MATCHED=0
+  ALL_GROUPS="$($AWS elbv2 describe-target-groups \
+    --query 'TargetGroups[*].TargetGroupName' \
+    --output text)"
+
+  if [[ -z "$ALL_GROUPS" || "$ALL_GROUPS" == "None" ]]; then
+    echo "No target groups found under profile: $PROFILE"
+    return
+  fi
+
+  for TG_NAME in $ALL_GROUPS; do
+    if [[ -n "$DISCOVER_FILTER" ]] && \
+       ! echo "$TG_NAME" | grep -qi "$DISCOVER_FILTER"; then
+      continue
+    fi
+    NOTE=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+      FAV_NAME="$(jq -r --arg tg "$TG_NAME" \
+        '(.favorites // {}) | to_entries[] | select(.value.target_group == $tg) | .key' \
+        "$CONFIG_FILE" 2>/dev/null | head -1)"
+      [[ -n "$FAV_NAME" ]] && NOTE="[favorite: $FAV_NAME]"
+    fi
+    printf "%-50s %s\n" "$TG_NAME" "$NOTE"
+    (( MATCHED++ )) || true
+  done
+
+  if [[ "$MATCHED" -eq 0 ]]; then
+    echo "(no target groups matched \"$DISCOVER_FILTER\")"
+  fi
+
+  echo
+  echo "To add a favorite, edit $CONFIG_FILE"
+}
+
+#
+# No-arg invocation: show favorites dashboard and exit.
+#
+if [[ $# -eq 0 ]]; then
+  show_favorites
+  exit 0
+fi
+
+#
+# --unsave <shortname>: remove a favorite from config.json.
+#
+if [[ "$1" == "--unsave" ]]; then
+  UNSAVE_NAME="${2:-}"
+  if [[ -z "$UNSAVE_NAME" ]]; then
+    echo "--unsave requires a shortname argument"
+    exit 1
+  fi
+
+  if [[ ! -f "$CONFIG_FILE" ]] || \
+     ! jq -e --arg k "$UNSAVE_NAME" '.favorites[$k] // empty' "$CONFIG_FILE" >/dev/null 2>&1; then
+    echo "No favorite named '$UNSAVE_NAME' found in $CONFIG_FILE"
+    exit 1
+  fi
+
+  echo "Removing favorite '$UNSAVE_NAME':"
+  jq -r --arg k "$UNSAVE_NAME" '.favorites[$k] | "  profile:      \(.profile)\n  target_group: \(.target_group)"' "$CONFIG_FILE"
+  echo
+  echo "Type 'yes' to confirm:"
+  read -r CONFIRM
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "Cancelled."
+    exit 1
+  fi
+
+  TMP="$(mktemp)"
+  jq --arg k "$UNSAVE_NAME" 'del(.favorites[$k])' "$CONFIG_FILE" > "$TMP"
+  mv "$TMP" "$CONFIG_FILE"
+
+  echo "Removed favorite '$UNSAVE_NAME'."
+  exit 0
+fi
+
+#
+# Catch other flags passed before a profile (e.g. alb-state --discover).
+#
+if [[ "$1" == --* ]]; then
+  echo "Error: a profile or favorites shortname must come first."
+  echo
+  echo "  $0 <profile> --discover"
+  echo "  $0 <shortname> [options]"
+  exit 1
+fi
+
+PROFILE=""
+TARGET_GROUP_NAME=""
+ADD_HOSTS=()
+REMOVE_HOSTS=()
+WATCH=0
+INTERVAL=5
+DISCOVER=0
+DISCOVER_FILTER=""
+SAVE_AS=""
+
+#
+# Resolve first argument: favorites shortname, or explicit profile name.
+#
+if [[ -f "$CONFIG_FILE" ]] && \
+   jq -e --arg k "$1" '.favorites[$k] // empty' "$CONFIG_FILE" >/dev/null 2>&1; then
+  PROFILE="$(jq -r --arg k "$1" '.favorites[$k].profile' "$CONFIG_FILE")"
+  TARGET_GROUP_NAME="$(jq -r --arg k "$1" '.favorites[$k].target_group' "$CONFIG_FILE")"
+  shift
+else
+  PROFILE="$1"
+  shift
+  # Next arg is the target group name unless it looks like a flag
+  if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    TARGET_GROUP_NAME="$1"
+    shift
+    # If it's a favorites shortname, resolve the target group name from it
+    # (the explicitly-provided profile takes precedence over the one in the favorite)
+    if [[ -f "$CONFIG_FILE" ]] && \
+       jq -e --arg k "$TARGET_GROUP_NAME" '.favorites[$k] // empty' "$CONFIG_FILE" >/dev/null 2>&1; then
+      TARGET_GROUP_NAME="$(jq -r --arg k "$TARGET_GROUP_NAME" '.favorites[$k].target_group' "$CONFIG_FILE")"
+    fi
+  fi
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --add)      ADD_HOSTS+=("${2:-}");    shift 2 ;;
+    --remove)   REMOVE_HOSTS+=("${2:-}"); shift 2 ;;
+    --watch)    WATCH=1;                  shift ;;
+    --interval) INTERVAL="${2:-5}";       shift 2 ;;
+    --discover)
+      DISCOVER=1
+      if [[ $# -gt 1 && "${2:-}" != --* ]]; then
+        DISCOVER_FILTER="${2:-}"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --save)
+      SAVE_AS="${2:-}"
+      if [[ -z "$SAVE_AS" ]]; then
+        echo "--save requires a shortname argument"
+        exit 1
+      fi
+      shift 2
+      ;;
+    *)          echo "Unknown argument: $1"; exit 1 ;;
+  esac
+done
+
+if [[ -z "$PROFILE" ]]; then
+  echo "Usage:"
+  echo "  $0                                           # favorites dashboard"
+  echo "  $0 <shortname> [options]                     # use a configured favorite"
+  echo "  $0 <profile> <target-group> [options]        # explicit profile + group"
+  echo "  $0 <profile> --discover                      # list all pools for a profile"
+  echo
+  echo "Options:"
+  echo "  --add HOSTNAME      Add host to target group (repeatable)"
+  echo "  --remove HOSTNAME   Remove host from target group (repeatable)"
+  echo "  --watch             Poll until state stabilizes"
+  echo "  --interval SECONDS  Watch poll interval (default: 5)"
+  echo "  --discover          List all available target groups"
+  exit 1
+fi
+
+AWS="aws-vault exec $PROFILE -- aws"
+
+#
+# --discover: list target groups for this profile and exit.
+#
+if [[ "$DISCOVER" -eq 1 ]]; then
+  do_discover
+  exit 0
+fi
+
+if [[ -z "$TARGET_GROUP_NAME" ]]; then
+  show_favorites "$PROFILE"
+  exit 0
+fi
+
+#
+# Infer environment and service name from target group name.
+#
+case "$TARGET_GROUP_NAME" in
+  *production*) ENV_FILTER="*production*" ;;
+  *staging*)    ENV_FILTER="*staging*" ;;
+  *develop*|*development*) ENV_FILTER="*develop*" ;;
+  *)
+    echo "Could not infer environment from target group: $TARGET_GROUP_NAME"
+    exit 1
+    ;;
+esac
+
+# Strip alb- prefix and environment suffix to get the service name.
+SERVICE_NAME="${TARGET_GROUP_NAME#alb-}"
+SERVICE_NAME="${SERVICE_NAME%-production}"
+SERVICE_NAME="${SERVICE_NAME%-staging}"
+SERVICE_NAME="${SERVICE_NAME%-develop}"
+SERVICE_NAME="${SERVICE_NAME%-development}"
+HOST_FILTER="*${SERVICE_NAME}*"
+
+#
+# Resolve target group ARN.
+#
+TG_ARN="$($AWS elbv2 describe-target-groups \
+  --names "$TARGET_GROUP_NAME" \
+  --query 'TargetGroups[0].TargetGroupArn' \
+  --output text)"
+
+if [[ -z "$TG_ARN" || "$TG_ARN" == "None" ]]; then
+  echo "Could not find target group: $TARGET_GROUP_NAME"
+  exit 1
+fi
+
+#
+# --save: write this profile + target group as a named favorite.
+#
+if [[ -n "$SAVE_AS" ]]; then
+  if [[ -f "$CONFIG_FILE" ]] && \
+     jq -e --arg k "$SAVE_AS" '.favorites[$k] // empty' "$CONFIG_FILE" >/dev/null 2>&1; then
+    echo "Favorite '$SAVE_AS' already exists:"
+    jq -r --arg k "$SAVE_AS" '.favorites[$k] | "  profile:      \(.profile)\n  target_group: \(.target_group)"' "$CONFIG_FILE"
+    echo
+    echo "Overwrite? (yes/no)"
+    read -r CONFIRM
+    if [[ "$CONFIRM" != "yes" ]]; then
+      echo "Cancelled."
+      exit 1
+    fi
+  fi
+
+  TMP="$(mktemp)"
+  jq --arg name "$SAVE_AS" \
+     --arg profile "$PROFILE" \
+     --arg tg "$TARGET_GROUP_NAME" \
+     '.favorites[$name] = { "profile": $profile, "target_group": $tg }' \
+     "$CONFIG_FILE" > "$TMP"
+  mv "$TMP" "$CONFIG_FILE"
+
+  echo "Saved favorite '$SAVE_AS':"
+  echo "  profile:      $PROFILE"
+  echo "  target_group: $TARGET_GROUP_NAME"
+  echo
+fi
+
+#
+# Helper: hostname -> instance ID
+#
+lookup_instance_id() {
+  local HOSTNAME="$1"
+
+  $AWS ec2 describe-instances \
+    --filters \
+      "Name=tag:Name,Values=$HOSTNAME" \
+      "Name=tag:Name,Values=$HOST_FILTER" \
+      "Name=tag:Name,Values=$ENV_FILTER" \
+      "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].InstanceId' \
+    --output text
+}
+
+#
+# Refuse simultaneous add/remove.
+#
+if [[ ${#ADD_HOSTS[@]} -gt 0 && ${#REMOVE_HOSTS[@]} -gt 0 ]]; then
+  echo "Refusing to add and remove in the same invocation."
+  exit 1
+fi
+
+#
+# ADD HOST(S)
+#
+if [[ ${#ADD_HOSTS[@]} -gt 0 ]]; then
+
+  REGISTER_IDS=()   # "instance-id:hostname" pairs to act on
+  SKIPPED=0
+
+  for ADD_HOST in "${ADD_HOSTS[@]}"; do
+
+    INSTANCE_ID="$(lookup_instance_id "$ADD_HOST")"
+
+    if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+      echo "Could not find a matching running host: $ADD_HOST"
+      exit 1
+    fi
+
+    if [[ "$(wc -w <<< "$INSTANCE_ID")" -ne 1 ]]; then
+      echo "Ambiguous hostname matched multiple instances: $ADD_HOST"
+      echo "$INSTANCE_ID"
+      exit 1
+    fi
+
+    CURRENT_STATE="$($AWS elbv2 describe-target-health \
+      --target-group-arn "$TG_ARN" \
+      --targets Id="$INSTANCE_ID" \
+      --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+      --output text 2>/dev/null)"
+
+    if [[ "$CURRENT_STATE" == "initial" || "$CURRENT_STATE" == "healthy" ]]; then
+      echo "  $ADD_HOST ($INSTANCE_ID): already registered (state: $CURRENT_STATE) — skipping"
+      (( SKIPPED++ )) || true
+      continue
+    fi
+
+    REGISTER_IDS+=("$INSTANCE_ID:$ADD_HOST")
+  done
+
+  if [[ ${#REGISTER_IDS[@]} -eq 0 ]]; then
+    echo
+    echo "All requested additions are already registered or in progress."
+    [[ "$WATCH" -eq 0 ]] && echo "Tip: re-run with --watch to monitor the current state."
+  else
+
+    echo
+    echo "============================================================"
+    echo " CONFIRMATION REQUIRED"
+    echo "============================================================"
+    echo
+    echo "Action: ADD host(s) to ALB target group"
+    echo
+    echo "Target group:"
+    echo "  $TARGET_GROUP_NAME"
+    echo
+    echo "Hosts to add:"
+    for ENTRY in "${REGISTER_IDS[@]}"; do
+      printf "  %-35s %s\n" "${ENTRY##*:}" "(${ENTRY%%:*})"
+    done
+    echo
+    echo "Type 'yes' to continue:"
+    read -r CONFIRM
+
+    if [[ "$CONFIRM" != "yes" ]]; then
+      echo "Cancelled."
+      exit 1
+    fi
+
+    for ENTRY in "${REGISTER_IDS[@]}"; do
+      $AWS elbv2 register-targets \
+        --target-group-arn "$TG_ARN" \
+        --targets Id="${ENTRY%%:*}"
+    done
+
+    echo
+    echo "Host registration initiated for ${#REGISTER_IDS[@]} host(s)."
+    [[ "$WATCH" -eq 0 ]] && echo "Tip: re-run with --watch to monitor until healthy."
+  fi
+fi
+
+#
+# REMOVE HOST(S)
+#
+if [[ ${#REMOVE_HOSTS[@]} -gt 0 ]]; then
+
+  DEREGISTER_IDS=()   # "instance-id:hostname" pairs to act on
+  SKIPPED=0
+
+  for REMOVE_HOST in "${REMOVE_HOSTS[@]}"; do
+
+    INSTANCE_ID="$(lookup_instance_id "$REMOVE_HOST")"
+
+    if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+      echo "Could not find a matching running host: $REMOVE_HOST"
+      exit 1
+    fi
+
+    if [[ "$(wc -w <<< "$INSTANCE_ID")" -ne 1 ]]; then
+      echo "Ambiguous hostname matched multiple instances: $REMOVE_HOST"
+      echo "$INSTANCE_ID"
+      exit 1
+    fi
+
+    CURRENT_STATE="$($AWS elbv2 describe-target-health \
+      --target-group-arn "$TG_ARN" \
+      --targets Id="$INSTANCE_ID" \
+      --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+      --output text 2>/dev/null)"
+
+    if [[ "$CURRENT_STATE" == "draining" ]]; then
+      echo "  $REMOVE_HOST ($INSTANCE_ID): already draining — skipping"
+      (( SKIPPED++ )) || true
+      continue
+    fi
+
+    if [[ -z "$CURRENT_STATE" || "$CURRENT_STATE" == "None" ]]; then
+      echo "  $REMOVE_HOST ($INSTANCE_ID): not currently registered in target group — skipping"
+      (( SKIPPED++ )) || true
+      continue
+    fi
+
+    DEREGISTER_IDS+=("$INSTANCE_ID:$REMOVE_HOST")
+  done
+
+  if [[ ${#DEREGISTER_IDS[@]} -eq 0 ]]; then
+    echo
+    echo "All requested removals are already in progress or not registered."
+    [[ "$WATCH" -eq 0 ]] && echo "Tip: re-run with --watch to monitor the current state."
+  else
+
+    # Refuse if removal would leave the pool with no non-draining targets.
+    TG_STATES="$($AWS elbv2 describe-target-health \
+      --target-group-arn "$TG_ARN" \
+      --query 'TargetHealthDescriptions[*].TargetHealth.State' \
+      --output text)"
+
+    TOTAL=0; ALREADY_DRAINING=0
+    for STATE in $TG_STATES; do
+      (( TOTAL++ )) || true
+      [[ "$STATE" == "draining" ]] && (( ALREADY_DRAINING++ )) || true
+    done
+
+    REMOVING=${#DEREGISTER_IDS[@]}
+    REMAINING=$(( TOTAL - ALREADY_DRAINING - REMOVING ))
+
+    if [[ "$REMAINING" -le 0 ]]; then
+      echo
+      echo "############################################################"
+      echo "# ERROR: Operation refused"
+      echo "#"
+      echo "# Removing ${REMOVING} host(s) would leave the pool empty"
+      echo "# (or with only draining targets)."
+      echo "#"
+      printf "#   Registered:       %d\n" "$TOTAL"
+      printf "#   Already draining: %d\n" "$ALREADY_DRAINING"
+      printf "#   To be removed:    %d\n" "$REMOVING"
+      printf "#   Remaining:        %d\n" "$REMAINING"
+      echo "#"
+      echo "# Add a replacement host first."
+      echo "############################################################"
+      exit 1
+    fi
+
+    echo
+    echo "============================================================"
+    echo " CONFIRMATION REQUIRED"
+    echo "============================================================"
+    echo
+    echo "Action: REMOVE host(s) from ALB target group"
+    echo
+    echo "Target group:"
+    echo "  $TARGET_GROUP_NAME"
+    echo
+    echo "Hosts to remove:"
+    for ENTRY in "${DEREGISTER_IDS[@]}"; do
+      printf "  %-35s %s\n" "${ENTRY##*:}" "(${ENTRY%%:*})"
+    done
+    echo
+    echo "Type 'yes' to continue:"
+    read -r CONFIRM
+
+    if [[ "$CONFIRM" != "yes" ]]; then
+      echo "Cancelled."
+      exit 1
+    fi
+
+    for ENTRY in "${DEREGISTER_IDS[@]}"; do
+      $AWS elbv2 deregister-targets \
+        --target-group-arn "$TG_ARN" \
+        --targets Id="${ENTRY%%:*}"
+    done
+
+    echo
+    echo "Host deregistration initiated for ${#DEREGISTER_IDS[@]} host(s)."
+    [[ "$WATCH" -eq 0 ]] && echo "Tip: re-run with --watch to monitor until fully drained."
+  fi
+fi
+
+#
+# Helper: display current target group status.
+# Writes count of transitional targets (initial/draining) to /tmp/alb-state-transitional.$$.
+#
+show_status() {
+  local INSTANCE_IDS TRANSITIONAL=0
+
+  INSTANCE_IDS="$($AWS elbv2 describe-target-health \
+    --target-group-arn "$TG_ARN" \
+    --query 'TargetHealthDescriptions[*].Target.Id' \
+    --output text)"
+
+  echo
+  echo "============================================================"
+  echo " CURRENT TARGET GROUP MEMBERS + HEALTH  $(date '+%H:%M:%S')"
+  echo "============================================================"
+  echo
+
+  if [[ -z "$INSTANCE_IDS" || "$INSTANCE_IDS" == "None" ]]; then
+
+    echo "No instances currently registered in target group."
+
+  else
+
+    printf "%-40s %-22s %-15s %-6s %-12s %s\n" \
+      "NAME" "INSTANCE ID" "PRIVATE IP" "PORT" "STATE" "REASON"
+
+    echo "----------------------------------------------------------------------------------------------------------------"
+
+    for INSTANCE_ID in $INSTANCE_IDS; do
+
+      NAME="$($AWS ec2 describe-instances \
+        --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].Tags[?Key==`Name`].Value|[0]' \
+        --output text)"
+
+      IP="$($AWS ec2 describe-instances \
+        --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+        --output text)"
+
+      read -r PORT STATE REASON <<< "$($AWS elbv2 describe-target-health \
+        --target-group-arn "$TG_ARN" \
+        --targets Id="$INSTANCE_ID" \
+        --query 'TargetHealthDescriptions[0].[Target.Port,TargetHealth.State,TargetHealth.Reason]' \
+        --output text)"
+
+      printf "%-40s %-22s %-15s %-6s %-12s %s\n" \
+        "$NAME" "$INSTANCE_ID" "$IP" "$PORT" "$STATE" "$REASON"
+
+      if [[ "$STATE" == "initial" || "$STATE" == "draining" ]]; then
+        (( TRANSITIONAL++ )) || true
+      fi
+
+    done
+  fi
+
+  #
+  # Possible hosts for this environment
+  #
+  echo
+  echo "============================================================"
+  echo " POSSIBLE HOSTS FOR THIS ENVIRONMENT"
+  echo "============================================================"
+  echo
+  echo "Filters:"
+  echo "  Name matches ${HOST_FILTER}"
+  echo "  Name matches ${ENV_FILTER}"
+  echo
+
+  $AWS ec2 describe-instances \
+    --filters \
+      "Name=tag:Name,Values=$HOST_FILTER" \
+      "Name=tag:Name,Values=$ENV_FILTER" \
+      "Name=instance-state-name,Values=running" \
+    --query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value|[0],InstanceId,PrivateIpAddress,State.Name]' \
+    --output table
+
+  # Return transitional count via a temp file so subshell output isn't consumed
+  echo "$TRANSITIONAL" > /tmp/alb-state-transitional.$$
+}
+
+#
+# Display current status (once or in a watch loop)
+#
+if [[ "$WATCH" -eq 1 || ${#ADD_HOSTS[@]} -gt 0 || ${#REMOVE_HOSTS[@]} -gt 0 ]]; then
+  show_status
+  TRANSITIONAL="$(cat /tmp/alb-state-transitional.$$ 2>/dev/null || echo 0)"
+  rm -f /tmp/alb-state-transitional.$$
+
+  if [[ "$WATCH" -eq 1 ]]; then
+    while [[ "$TRANSITIONAL" -gt 0 ]]; do
+      echo
+      echo "  [watch] $TRANSITIONAL target(s) still transitioning — polling again in ${INTERVAL}s  (Ctrl-C to stop)"
+      sleep "$INTERVAL"
+      show_status
+      TRANSITIONAL="$(cat /tmp/alb-state-transitional.$$ 2>/dev/null || echo 0)"
+      rm -f /tmp/alb-state-transitional.$$
+    done
+    echo
+    echo "  [watch] All targets are in a stable state."
+  fi
+else
+  show_status
+  rm -f /tmp/alb-state-transitional.$$
+fi

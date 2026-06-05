@@ -1,0 +1,22 @@
+{
+  "pipeline_filter": "*uva-drupal*",
+  "refresh_interval": 30,
+  "favorites": {
+    "drupal-prod": {
+      "profile": "staging",
+      "target_group": "alb-library-drupal-production"
+    },
+    "drupal-staging": {
+      "profile": "staging",
+      "target_group": "alb-library-drupal-staging"
+    },
+    "dh-prod": {
+      "profile": "staging",
+      "target_group": "alb-dh-drupal-production"
+    },
+    "alb-dsf": {
+      "profile": "staging",
+      "target_group": "alb-dsf-drupal-production"
+    }
+  }
+}
