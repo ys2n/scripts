@@ -4,6 +4,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 
+# Run an aws command with credentials.
+# First arg is the aws-vault profile (used only if aws-vault is needed).
+# Prefers credentials already in the environment; falls back to aws-vault.
+aws_run() {
+  local profile="$1"; shift
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+    aws "$@"
+  elif command -v aws-vault &>/dev/null; then
+    aws-vault exec "$profile" -- aws "$@"
+  else
+    aws "$@"
+  fi
+}
+
 #
 # Favorites dashboard — called when script is invoked with no arguments.
 # Makes live AWS calls per favorite; groups by profile to minimize vault prompts.
@@ -50,7 +64,7 @@ show_favorites() {
 
   while IFS=$'\t' read -r NAME PROF TG; do
     local TG_ARN HEALTH TOTAL HEALTHY STATE
-    TG_ARN="$(aws-vault exec "$PROF" -- aws elbv2 describe-target-groups \
+    TG_ARN="$(aws_run "$PROF" elbv2 describe-target-groups \
       --names "$TG" \
       --query 'TargetGroups[0].TargetGroupArn' \
       --output text 2>/dev/null || echo "None")"
@@ -60,7 +74,7 @@ show_favorites() {
       continue
     fi
 
-    HEALTH="$(aws-vault exec "$PROF" -- aws elbv2 describe-target-health \
+    HEALTH="$(aws_run "$PROF" elbv2 describe-target-health \
       --target-group-arn "$TG_ARN" \
       --query 'TargetHealthDescriptions[*].TargetHealth.State' \
       --output text 2>/dev/null || echo "")"
@@ -258,7 +272,7 @@ if [[ -z "$PROFILE" ]]; then
   exit 1
 fi
 
-AWS="aws-vault exec $PROFILE -- aws"
+AWS="aws_run $PROFILE"
 
 #
 # --discover: list target groups for this profile and exit.
