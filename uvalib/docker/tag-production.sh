@@ -6,7 +6,7 @@
 #   commit     git SHA or ref to tag (default: HEAD)
 #   -s SUFFIX  append suffix to tag name
 #              e.g. -s security_patch → production_2026_06_08_security_patch
-#   -n         dry run — show what would happen without making changes
+#   -n|--dry-run  dry run — show what would happen without making changes
 #   -h         show this help
 #
 # The ECR repository name is derived from the git remote URL (org/repo).
@@ -33,21 +33,22 @@ SUFFIX=""
 
 usage() {
     echo "Usage: $(basename "$0") [-s SUFFIX] [-n] [commit]"
-    echo "  -s SUFFIX  tag suffix (e.g. 'security_patch')"
-    echo "  -n         dry run"
-    echo "  -h         this help"
+    echo "  -s SUFFIX      tag suffix (e.g. 'security_patch')"
+    echo "  -n, --dry-run  dry run"
+    echo "  -h, --help     this help"
     exit "${1:-0}"
 }
 
-while getopts "s:nh" opt; do
-    case $opt in
-        s) SUFFIX="_${OPTARG}" ;;
-        n) DRYRUN=true ;;
-        h) usage ;;
-        *) usage 1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s) SUFFIX="_${2:?-s requires an argument}"; shift 2 ;;
+        -n|--dry-run) DRYRUN=true; shift ;;
+        -h|--help) usage; shift ;;
+        --) shift; break ;;
+        -*) echo "Unknown option: $1" >&2; usage 1 ;;
+        *) break ;;
     esac
 done
-shift $((OPTIND - 1))
 
 COMMIT="${1:-HEAD}"
 
