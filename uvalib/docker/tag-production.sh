@@ -14,6 +14,22 @@
 
 set -euo pipefail
 
+# Locate GNU getopt (BSD getopt shipped with macOS does not support long options).
+find_gnu_getopt() {
+    for candidate in \
+        "$(brew --prefix gnu-getopt 2>/dev/null)/bin/getopt" \
+        /opt/homebrew/opt/gnu-getopt/bin/getopt \
+        /usr/local/opt/gnu-getopt/bin/getopt; do
+        [[ -x "$candidate" ]] && { echo "$candidate"; return; }
+    done
+    if getopt --version 2>&1 | grep -q GNU; then
+        echo "getopt"; return
+    fi
+    echo "GNU getopt not found. Install with: brew install gnu-getopt" >&2
+    exit 1
+}
+GETOPT=$(find_gnu_getopt)
+
 # Resolve AWS command.
 # Prefers credentials already in the environment (inside an aws-vault exec session,
 # or a plain AWS_PROFILE). Falls back to aws-vault if AWS_VAULT_PROFILE is set.
@@ -39,14 +55,15 @@ usage() {
     exit "${1:-0}"
 }
 
-while [[ $# -gt 0 ]]; do
+PARSED=$("$GETOPT" -o s:nh --long suffix:,dry-run,help -n "$(basename "$0")" -- "$@")
+eval set -- "$PARSED"
+while true; do
     case "$1" in
-        -s) SUFFIX="_${2:?-s requires an argument}"; shift 2 ;;
-        -n|--dry-run) DRYRUN=true; shift ;;
-        -h|--help) usage; shift ;;
-        --) shift; break ;;
-        -*) echo "Unknown option: $1" >&2; usage 1 ;;
-        *) break ;;
+        -s|--suffix)   SUFFIX="_$2"; shift 2 ;;
+        -n|--dry-run)  DRYRUN=true;  shift ;;
+        -h|--help)     usage;        shift ;;
+        --)            shift;        break ;;
+        *)             break ;;
     esac
 done
 
