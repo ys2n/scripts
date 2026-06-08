@@ -14,6 +14,20 @@
 
 set -euo pipefail
 
+# Resolve AWS command.
+# Prefers credentials already in the environment (inside an aws-vault exec session,
+# or a plain AWS_PROFILE). Falls back to aws-vault if AWS_VAULT_PROFILE is set.
+# Otherwise calls aws directly and lets it fail naturally if unconfigured.
+aws_run() {
+    if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+        aws "$@"
+    elif command -v aws-vault &>/dev/null && [[ -n "${AWS_VAULT_PROFILE:-}" ]]; then
+        aws-vault exec "${AWS_VAULT_PROFILE}" -- aws "$@"
+    else
+        aws "$@"
+    fi
+}
+
 DRYRUN=false
 SUFFIX=""
 
@@ -59,7 +73,7 @@ if git tag | grep -qx "$PROD_TAG"; then
 fi
 
 # Guard: ECR tag must not already exist
-EXISTING_ECR=$(aws ecr batch-get-image \
+EXISTING_ECR=$(aws_run ecr batch-get-image \
     --repository-name "$ECR_REPO" \
     --image-ids imageTag="$PROD_TAG" \
     --query 'images[0].imageId.imageTag' \
@@ -70,7 +84,7 @@ if [[ -n "$EXISTING_ECR" && "$EXISTING_ECR" != "None" ]]; then
 fi
 
 # Fetch the image manifest for the target commit
-MANIFEST=$(aws ecr batch-get-image \
+MANIFEST=$(aws_run ecr batch-get-image \
     --repository-name "$ECR_REPO" \
     --image-ids imageTag="$GITCOMMIT_TAG" \
     --query 'images[0].imageManifest' \
@@ -90,7 +104,7 @@ if $DRYRUN; then
 fi
 
 echo "Tagging ECR image..."
-aws ecr put-image \
+aws_run ecr put-image \
     --repository-name "$ECR_REPO" \
     --image-tag "$PROD_TAG" \
     --image-manifest "$MANIFEST" \
