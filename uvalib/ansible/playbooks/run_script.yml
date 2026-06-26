@@ -1,0 +1,64 @@
+---
+- name: Run script on remote hosts and gather results
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Copy script to remote host
+      copy:
+        src: remote_script.sh
+        dest: /tmp/remote_script.sh
+        mode: '0755'
+
+    - name: Execute the script
+      command: /tmp/remote_script.sh
+      register: script_output
+
+    - name: Set fact for host result
+      set_fact:
+        host_result: "{{ script_output.stdout }}"
+
+    - name: Register results as a fact
+      set_fact:
+        all_results: "{{ hostvars.localhost.all_results | default({}) | combine({inventory_hostname: host_result}) }}"
+
+    - name: Save results to a temporary file on localhost
+      local_action:
+        module: copy
+        content: "{{ all_results | to_nice_json }}"
+        dest: /tmp/partial_results_{{ inventory_hostname }}.json
+      delegate_to: localhost
+      run_once: true
+
+- name: Merge and save final results on control node
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Find all partial results files
+      find:
+        paths: /tmp
+        patterns: "partial_results_*.json"
+      register: partial_result_files
+
+    - name: Read partial results
+      command: cat {{ item.path }}
+      loop: "{{ partial_result_files.files }}"
+      register: partial_results
+
+    - name: Combine partial results
+      set_fact:
+        combined_results: {}
+
+    - name: Add partial results to combined results
+      set_fact:
+        combined_results: "{{ combined_results | combine(item | from_json) }}"
+      loop: "{{ partial_results.results | map(attribute='stdout') | list }}"
+
+    - name: Save final results to file
+      copy:
+        content: "{{ combined_results | to_nice_json }}"
+        dest: ./final_results.json
+
+    - name: Display final results
+      debug:
+        msg: "{{ combined_results }}"
+

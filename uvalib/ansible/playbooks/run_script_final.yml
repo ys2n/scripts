@@ -1,0 +1,50 @@
+---
+- name: Run script on remote hosts and gather results
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Copy script to remote host
+      copy:
+        src: remote_script.sh
+        dest: /tmp/remote_script.sh
+        mode: '0755'
+
+    - name: Execute the script
+      command: /tmp/remote_script.sh
+      register: script_output
+
+    - name: Set fact for host result
+      set_fact:
+        host_result: "{{ {inventory_hostname: script_output.stdout} }}"
+
+    - name: Add host result to the centralized results
+      set_fact:
+        all_results: "{{ all_results | default({}) | combine(host_result) }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Save all results to a temporary file on localhost
+      local_action:
+        module: copy
+        content: "{{ all_results | to_nice_json }}"
+        dest: /tmp/final_results.json
+      delegate_to: localhost
+      run_once: true
+
+- name: Aggregate results from all hosts
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Ensure final results file is created
+      stat:
+        path: /tmp/final_results.json
+      register: final_results_stat
+
+    - name: Debug final results file creation
+      debug:
+        msg: "Final results file exists: {{ final_results_stat.stat.exists }}"
+
+    - name: Display final results
+      debug:
+        msg: "{{ lookup('file', '/tmp/final_results.json') }}"
+

@@ -1,0 +1,8 @@
+#!/bin/bash
+TF_DIR=${TF_DIR:=/Users/ys2n/Code/uvalib/terraform-infrastructure}
+INV_FILES=`find $TF_DIR -name inventory.generated -print`
+for f in $INV_FILES; do
+  echo "[`echo "${f}" | awk -F/ '{print $(NF-3)"-"$(NF-2)}' | sed -E 's/([^\.]+)\.?[^/]+\-([^/]+)/\1_\2/'`]"
+  grep -Ev '^\s*#|^\s*$' $f 
+  echo
+done;

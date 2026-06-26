@@ -1,0 +1,51 @@
+---
+- name: Run script on remote hosts and gather results
+  hosts: all
+  gather_facts: no
+  vars:
+    results: {}
+
+  tasks:
+    - name: Copy script to remote host
+      copy:
+        src: remote_script.sh
+        dest: /tmp/remote_script.sh
+        mode: '0755'
+
+    - name: Execute the script
+      command: /tmp/remote_script.sh
+      register: script_output
+
+    - name: Debug script output
+      debug:
+        msg: "Host {{ inventory_hostname }} output: {{ script_output.stdout }}"
+
+    - name: Set fact for host result
+      set_fact:
+        host_result: "{{ script_output.stdout }}"
+
+    - name: Update results dictionary
+      set_fact:
+        results: "{{ results | combine({inventory_hostname: host_result}) }}"
+
+    - name: Debug results dictionary
+      debug:
+        msg: "{{ results }}"
+
+    - name: Save results to file
+      local_action:
+        module: copy
+        content: "{{ results | to_nice_json }}"
+        dest: ./final_results.$$.json
+      delegate_to: localhost
+
+    - name: Display final results
+      local_action:
+        module: shell
+        cmd: cat ./final_results.json
+      register: final_results
+      delegate_to: localhost
+
+    - name: Print final results
+      debug:
+        msg: "{{ final_results.stdout }}"
