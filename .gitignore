@@ -1,0 +1,17 @@
+# Editor / IDE
+.vscode/
+
+# Ansible generated artifacts (regenerate via scripts/build-inventory)
+inventory.generated
+out.txt
+final_results.json
+partial_results_*.json
+
+# Private keys (referenced from the Terraform repo, never commit them here)
+*.pem
+
+# Scratch / iteration cruft
+*.bak
+*_debug*.yml
+*_last.yml
+test-run
