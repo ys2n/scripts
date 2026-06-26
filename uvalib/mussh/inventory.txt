@@ -1,0 +1,12 @@
+library-drupal-0.internal.lib.virginia.edu
+library-drupal-1.internal.lib.virginia.edu
+library-drupal-dev-0.internal.lib.virginia.edu
+library-drupal-test.internal.lib.virginia.edu
+
+dh-drupal-0.internal.lib.virginia.edu
+dh-drupal-dev-0.internal.lib.virginia.edu
+dh-drupal-dev-1.internal.lib.virginia.edu
+
+mandala-drupal-0.internal.lib.virginia.edu
+mandala-drupal-dev-0.internal.lib.virginia.edu
+mandala-drupal-dev-1.internal.lib.virginia.edu
