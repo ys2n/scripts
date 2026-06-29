@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# solr-compare — per-document diff of Mandala Solr content across environments.
+#
+# Reads UID/ID lists from $IDLISTS, fetches each document from every configured
+# environment, normalizes them (see solr-lib.sh), and diffs each environment
+# against the baseline (config.compare_baseline, default libdev) with `jd`.
+# Non-empty diffs are written to $TMPOUT/<uid>-<env>-<baseline>.diff and printed;
+# per-document results are recorded in a gdbm database.
+#
+# $TMPOUT is a cache: a document is skipped if its per-env JSON already exists.
+# Delete the relevant $TMPOUT/<uid>-test-*.json files to force a refresh.
+#
+# Usage:
+#   solr-compare [FILTER_REGEX]     Compare kmterms/kmassets docs (keyed by uid).
+#                                   FILTER_REGEX (egrep) narrows the uid list,
+#                                   e.g. solr-compare '^places'
+#   solr-compare --av [FILTER]      Compare av-core docs (keyed by id) instead.
+#
+# Core is inferred per uid: places/subjects/terms -> kmterms, else kmassets.
+# Data dirs default to ./idlists and ./tmpout; override with SOLR_IDLISTS /
+# SOLR_TMPOUT / SOLR_STATEDIR.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=solr-lib.sh
+source "$SCRIPT_DIR/solr-lib.sh"
+require jd
+require gdbmtool
+
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+
+AV=0
+FILTER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --av)      AV=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*)       echo "Unknown option: $1" >&2; echo >&2; usage >&2; exit 1 ;;
+    *)         FILTER="$1"; shift ;;
+  esac
+done
+
+mkdir -p "$TMPOUT"
+BASELINE="$(compare_baseline)"
+load_envs
+
+# Collect the relevant idlist files. av idlists are named *_av_*_idlist.txt and
+# carry `.id`; everything else is *_idlist.txt and carries `.uid`.
+shopt -s nullglob
+if [[ "$AV" -eq 1 ]]; then
+  KEY=id
+  FILES=( "$IDLISTS"/*_av_*_idlist.txt )
+else
+  KEY=uid
+  FILES=()
+  for f in "$IDLISTS"/*_idlist.txt; do [[ "$f" == *_av_* ]] || FILES+=("$f"); done
+fi
+shopt -u nullglob
+
+[[ ${#FILES[@]} -gt 0 ]] || { echo "No idlist files found in $IDLISTS" >&2; exit 1; }
+
+IDS="$(cat "${FILES[@]}" | sort -u | jq -r ".$KEY")"
+[[ -n "$FILTER" ]] && IDS="$(grep -E "$FILTER" <<<"$IDS" || true)"
+[[ -n "$IDS" ]] || { echo "No ${KEY}s to compare (filter: ${FILTER:-none})." >&2; exit 0; }
+
+for id in $IDS; do
+  if [[ "$AV" -eq 1 ]]; then
+    core=av
+    uid="${id//\//-}"     # ids contain slashes; flatten for filenames
+    query="id:$id"
+    gdbm="$STATEDIR/solr-compare-av.gdbm"
+  else
+    uid="$id"
+    case "$uid" in
+      places*|subjects*|terms*) core=terms ;;
+      *)                        core=assets ;;
+    esac
+    query="uid:$id"
+    gdbm="$STATEDIR/solr-compare-${uid%%-*}.gdbm"
+  fi
+
+  # Cache check: skip the document only if every env's JSON is already present.
+  need=0
+  for env in "${ENVS[@]}"; do
+    [[ -f "$TMPOUT/$uid-test-$env.json" ]] || { need=1; break; }
+  done
+  if [[ "$need" -eq 0 ]]; then
+    echo "already done: $uid"
+    continue
+  fi
+
+  echo "QUERY: $query"
+  for env in "${ENVS[@]}"; do
+    fetch_doc "$env" "$core" "$query" "$TMPOUT/$uid-test-$env.json" || true
+  done
+
+  diffs=""
+  for env in "${ENVS[@]}"; do
+    [[ "$env" == "$BASELINE" ]] && continue
+    d="$TMPOUT/$uid-$env-$BASELINE.diff"
+    jd "$TMPOUT/$uid-test-$env.json" "$TMPOUT/$uid-test-$BASELINE.json" > "$d" || true
+    if [[ -s "$d" ]]; then
+      echo "$env vs $BASELINE"
+      cat "$d"
+      diffs+=" $env"
+    else
+      rm -f "$d"
+    fi
+  done
+
+  gdbmtool -s "$gdbm" store "$uid" "checked$diffs"
+done

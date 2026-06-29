@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# solr-idlists — (re)generate the UID/ID lists that solr-compare consumes.
+#
+# For each target in config.export_targets, queries every environment that
+# defines the target's core and writes one JSON object per line to
+# $IDLISTS/<env>_<name>_idlist.txt. terms/assets targets carry `.uid`; av
+# targets carry `.id` and are named *_av_*_idlist.txt so solr-compare --av
+# picks them up.
+#
+# Usage:
+#   solr-idlists export [NAME_REGEX]   Export all targets, or those whose name
+#                                      matches NAME_REGEX (e.g. 'av|places').
+#
+# Output dir defaults to ./idlists; override with SOLR_IDLISTS.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=solr-lib.sh
+source "$SCRIPT_DIR/solr-lib.sh"
+
+usage() { sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  export) ;;
+  ""|-h|--help|help) usage; exit 0 ;;
+  *) echo "Unknown command: $cmd" >&2; echo >&2; usage >&2; exit 1 ;;
+esac
+
+FILTER="${1:-}"
+mkdir -p "$IDLISTS"
+load_envs
+
+while IFS=$'\t' read -r name core query fl; do
+  [[ -n "$FILTER" && ! "$name" =~ $FILTER ]] && continue
+  for env in "${ENVS[@]}"; do
+    url="$(core_url "$env" "$core")" || continue
+    out="$IDLISTS/${env}_${name}_idlist.txt"
+    echo "exporting $env $name -> $out" >&2
+    curl -s --get "$url/select" \
+      --data wt=json --data rows=800000 \
+      --data-urlencode "q=$query" \
+      --data-urlencode "sort=$(core_sort "$core")" \
+      --data-urlencode "fl=$fl" \
+      | jq -c -r '.response.docs[]' > "$out"
+  done
+done < <(jq -r '.export_targets[] | [.name, .core, .query, .fl] | @tsv' "$CONFIG_FILE")

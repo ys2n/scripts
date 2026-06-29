@@ -1,0 +1,55 @@
+{
+  "environments": {
+    "ssprod": {
+      "label": "SearchStax prod",
+      "base": "https://ss395824-us-east-1-aws.measuredsearch.com/solr/",
+      "cores": { "terms": "kmterms_prod", "assets": "kmassets", "av": "av" }
+    },
+    "ssdev": {
+      "label": "SearchStax dev",
+      "base": "https://ss251856-us-east-1-aws.measuredsearch.com/solr/",
+      "cores": { "terms": "kmterms_dev", "assets": "kmassets_dev", "av": "av_dev" }
+    },
+    "libdev": {
+      "label": "UVA replica dev",
+      "base": "https://mandala-solr-replica-dev.internal.lib.virginia.edu/solr/",
+      "cores": { "terms": "kmterms", "assets": "kmassets", "av": "mandala-av" }
+    },
+    "libprod": {
+      "label": "UVA replica prod",
+      "base": "https://mandala-solr-replica.internal.lib.virginia.edu/solr/",
+      "cores": { "terms": "kmterms", "assets": "kmassets", "av": "mandala-av" }
+    }
+  },
+
+  "compare_baseline": "libdev",
+
+  "count_targets": [
+    { "label": "kmterms places",    "core": "terms",  "query": "tree:places" },
+    { "label": "kmterms subjects",  "core": "terms",  "query": "tree:subjects" },
+    { "label": "kmterms terms",     "core": "terms",  "query": "tree:terms" },
+    { "label": "kmassets av",       "core": "assets", "query": "asset_type:audio-video" },
+    { "label": "kmassets images",   "core": "assets", "query": "asset_type:images" },
+    { "label": "kmassets texts",    "core": "assets", "query": "asset_type:texts" },
+    { "label": "kmassets sources",  "core": "assets", "query": "asset_type:sources" },
+    { "label": "kmassets visuals",  "core": "assets", "query": "asset_type:visuals" },
+    { "label": "kmassets subjects", "core": "assets", "query": "asset_type:subjects" },
+    { "label": "kmassets terms",    "core": "assets", "query": "asset_type:terms" },
+    { "label": "kmassets places",   "core": "assets", "query": "asset_type:places" },
+    { "label": "av transcripts",    "core": "av",     "query": "entity_type:tcu" },
+    { "label": "av nodes",          "core": "av",     "query": "entity_type:node" }
+  ],
+
+  "export_targets": [
+    { "name": "places",      "core": "terms",  "query": "tree:places",            "fl": "uid,header" },
+    { "name": "subjects",    "core": "terms",  "query": "tree:subjects",          "fl": "uid,header" },
+    { "name": "terms",       "core": "terms",  "query": "tree:terms",             "fl": "uid,header" },
+    { "name": "audio-video", "core": "assets", "query": "asset_type:audio-video", "fl": "uid,title" },
+    { "name": "images",      "core": "assets", "query": "asset_type:images",      "fl": "uid,title" },
+    { "name": "texts",       "core": "assets", "query": "asset_type:texts",       "fl": "uid,title" },
+    { "name": "sources",     "core": "assets", "query": "asset_type:sources",     "fl": "uid,title" },
+    { "name": "visuals",     "core": "assets", "query": "asset_type:visuals",     "fl": "uid,title" },
+    { "name": "av_trans",    "core": "av",     "query": "entity_type:tcu",        "fl": "id,entity_type" },
+    { "name": "av_node",     "core": "av",     "query": "entity_type:node",       "fl": "id,entity_type" }
+  ]
+}

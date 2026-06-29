@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# solr-counts — document-count comparison across the Mandala Solr environments.
+#
+# For each target in config.count_targets, queries every environment that
+# defines the target's core and prints a column per environment. "-" means the
+# environment has no such core; "?" means the query failed.
+#
+# Usage: solr-counts
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=solr-lib.sh
+source "$SCRIPT_DIR/solr-lib.sh"
+
+case "${1:-}" in
+  -h|--help) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+load_envs
+
+printf "%-22s" "CONTENT TYPE"
+for env in "${ENVS[@]}"; do printf "%14s" "$env"; done
+printf "\n"
+printf -- "%.0s-" $(seq 1 $((22 + 14 * ${#ENVS[@]}))); printf "\n"
+
+while IFS=$'\t' read -r label core query; do
+  printf "%-22s" "$label"
+  for env in "${ENVS[@]}"; do
+    printf "%14s" "$(solr_count "$env" "$core" "$query")"
+  done
+  printf "\n"
+done < <(jq -r '.count_targets[] | [.label, .core, .query] | @tsv' "$CONFIG_FILE")
