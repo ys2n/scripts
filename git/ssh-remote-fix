@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ssh-remote-fix — convert a git remote's HTTPS GitHub URL to SSH, after
+# verifying SSH access to GitHub actually works.
+#
+# Usage: ssh-remote-fix [REMOTE]   (default remote: origin)
+
+REMOTE=${1:-origin}
+
+# --- 1. Ensure we're in a git repo ---
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "❌ Not inside a git repository"
+  exit 1
+fi
+
+# --- 2. Ensure the remote exists ---
+if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
+  echo "❌ Remote '$REMOTE' does not exist"
+  exit 1
+fi
+
+OLD_URL=$(git remote get-url "$REMOTE")
+
+# --- 3. Check that it's an HTTPS GitHub URL ---
+if [[ ! "$OLD_URL" =~ ^https?://github.com/([^/]+)/([^/.]+)(\.git)?$ ]]; then
+  echo "ℹ️ Remote '$REMOTE' is not an HTTPS GitHub URL:"
+  echo "   $OLD_URL"
+  echo "   No changes made."
+  exit 0
+fi
+
+OWNER="${BASH_REMATCH[1]}"
+REPO="${BASH_REMATCH[2]}"
+NEW_URL="git@github.com:${OWNER}/${REPO}.git"
+
+# --- 4. Test SSH connectivity to GitHub ---
+# `ssh -T git@github.com` exits non-zero even on success (GitHub allows no shell),
+# so capture its output and decide from the banner, not the exit status.
+echo "🔐 Testing SSH access to GitHub..."
+AUTH_OUTPUT="$(ssh -T git@github.com 2>&1 || true)"
+
+if ! grep -q "successfully authenticated" <<<"$AUTH_OUTPUT"; then
+  echo "❌ SSH authentication to GitHub failed."
+  echo
+  echo "Make sure you have:"
+  echo "  - an SSH key loaded (ssh-add -l)"
+  echo "  - the key added to GitHub"
+  echo "  - correct ~/.ssh/config (if used)"
+  echo
+  echo "Aborting without making changes."
+  exit 1
+fi
+
+echo "✅ SSH authentication to GitHub confirmed."
+
+# --- 5. Switch the remote ---
+echo "🔁 Switching remote '$REMOTE'"
+echo "   from: $OLD_URL"
+echo "   to:   $NEW_URL"
+
+git remote set-url "$REMOTE" "$NEW_URL"
+
+# --- 6. Final verification ---
+echo "🔎 Verifying new remote..."
+git remote get-url "$REMOTE"
+
+echo "🎉 Done."

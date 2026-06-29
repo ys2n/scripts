@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# uvado — run a command as a privileged user through an su + sudo chain,
+# prompting for the password only once (driven by expect).
+#
+# Consolidates the old uvado.sh / uvado2.sh. Target user defaults to libadm;
+# override with -u USER or $UVADO_USER.
+#
+# Usage:
+#   uvado [-u USER] <command> [args...]
+# Examples:
+#   uvado systemctl restart nginx
+#   uvado -u someadmin tail -n 100 /var/log/messages
+
+target_user="${UVADO_USER:-libadm}"
+
+usage() { sed -n '4,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u)        target_user="${2:?-u requires a username}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; break ;;
+    -*)        echo "Unknown option: $1" >&2; echo >&2; usage >&2; exit 1 ;;
+    *)         break ;;
+  esac
+done
+
+[[ $# -ge 1 ]] || { echo "Error: no command given." >&2; echo >&2; usage >&2; exit 1; }
+command -v expect >/dev/null 2>&1 || {
+  echo "Error: 'expect' is not installed (try: brew install expect)." >&2; exit 1; }
+
+read -r -s -p "Password for $target_user: " password
+echo
+
+cmd="$*"
+
+# Feed the password to both the su and sudo prompts; stream the command's
+# output back (log_user 1). The password is sent via expect's send, never on a
+# command line, so it does not appear in the process list.
+expect <<EOF
+log_user 1
+set timeout 100
+spawn su - $target_user -c "sudo $cmd"
+expect {
+    -re "(?i)password.*:" {
+        send "$password\r"
+        exp_continue
+    }
+    eof
+}
+EOF

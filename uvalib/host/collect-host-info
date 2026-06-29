@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# collect-host-info — report MySQL / OS / drush status for Drupal Docker hosts.
+# SSHes to each host and inspects the drupal-0 container.
+#
+# Usage: collect-host-info <host>...
+
+[[ $# -ge 1 ]] || { sed -n '4,7p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+for h in "$@"; do
+  echo "=== $h ==="
+  echo "MYSQL VERSION:  $(ssh -t "$h" 'sudo docker exec drupal-0 drush sqlq "SELECT VERSION();"' 2>/dev/null)"
+  echo "DOCKER HOST OS: $(ssh "$h" 'grep PRETTY_NAME /etc/os-release')"
+  echo "CONTAINER OS:   $(ssh "$h" 'sudo docker exec drupal-0 grep PRETTY_NAME /etc/os-release')"
+  echo "DRUSH STATUS:   $(ssh "$h" 'sudo docker exec drupal-0 drush status --format json')"
+  echo
+done
