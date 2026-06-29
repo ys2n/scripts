@@ -5,19 +5,42 @@ set -euo pipefail
 #
 # For each target in config.count_targets, queries every environment that
 # defines the target's core and prints a column per environment. "-" means the
-# environment has no such core; "?" means the query failed.
+# environment has no such core; "?" means the query failed. A cheap drift check
+# across the four environments defined in config.json.
 #
 # Usage: solr-counts
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=solr-lib.sh
-source "$SCRIPT_DIR/solr-lib.sh"
+CONFIG_FILE="${SOLR_CONFIG:-$SCRIPT_DIR/config.json}"
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo "Required tool not found: $1" >&2; exit 1; }; }
+require jq
+require curl
+[[ -f "$CONFIG_FILE" ]] || { echo "Config not found: $CONFIG_FILE" >&2; exit 1; }
 
 case "${1:-}" in
-  -h|--help) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '4,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-load_envs
+# core_url ENV CORE -> base URL for that core; non-zero exit if the env lacks it.
+core_url() {
+  jq -er --arg e "$1" --arg c "$2" \
+    '.environments[$e] as $x | ($x.cores[$c] // "") as $n
+     | if $n == "" then error("no core") else ($x.base + $n) end' \
+    "$CONFIG_FILE" 2>/dev/null
+}
+
+# solr_count ENV CORE QUERY -> numFound ("-" if env lacks core, "?" on error).
+solr_count() {
+  local url
+  url="$(core_url "$1" "$2")" || { echo "-"; return; }
+  curl -s --get "$url/select" --data wt=json --data rows=0 \
+    --data-urlencode "q=$3" | jq -r '.response.numFound // "?"'
+}
+
+# Environment keys, in config order. (Avoids `mapfile`, absent from macOS bash 3.2.)
+ENVS=()
+while IFS= read -r e; do ENVS+=("$e"); done < <(jq -r '.environments | keys_unsorted[]' "$CONFIG_FILE")
 
 printf "%-22s" "CONTENT TYPE"
 for env in "${ENVS[@]}"; do printf "%14s" "$env"; done

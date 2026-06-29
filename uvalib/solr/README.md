@@ -1,8 +1,11 @@
 # uvalib/solr
 
-Tools for comparing the Mandala Solr search index across its four environments.
-Distilled from the ad-hoc `compare-solr-*` scripts in the old `~/scripts`
-junk drawer into a single config-driven set.
+Drift check for the Mandala Solr search index across its four environments.
+
+The fuller per-document comparison machinery (`solr-compare`, `solr-idlists`,
+`entity-munge`) existed to verify parity during the SearchStax → self-hosted
+migration. That migration is over, so only the lightweight count check remains;
+the rest is recoverable from git history and the old `~/scripts` if ever needed.
 
 ## Environments and cores
 
@@ -15,39 +18,18 @@ The index lives in four environments, defined in [`config.json`](config.json):
 | `libdev`  | UVA replica dev (internal.lib)    | `kmterms`      | `kmassets`     | `mandala-av` |
 | `libprod` | UVA replica prod (internal.lib)   | `kmterms`      | `kmassets`     | `mandala-av` |
 
-Three logical cores: **terms** (knowledge-map terms — places/subjects/terms,
-using Solr block-join child docs), **assets** (digital assets — images, texts,
-sources, visuals, audio-video), and **av** (audio/video transcripts and nodes).
-To add an environment or rename a core, edit `config.json` only.
+Three logical cores: **terms** (knowledge-map terms — places/subjects/terms),
+**assets** (digital assets — images, texts, sources, visuals, audio-video), and
+**av** (audio/video transcripts and nodes). To add an environment, rename a
+core, or change what gets counted, edit `config.json` only.
 
-## Requirements
+## Usage
 
-`jq`, `curl`, plus `jd` (structural JSON diff) and `gdbmtool` for `solr-compare`,
-and Perl with `HTML::Entities` for `entity-munge`.
+```
+solr-counts
+```
 
-## Scripts
-
-- **`solr-compare [FILTER]`** — per-document diff across environments. Reads the
-  UID lists, fetches each doc from every environment, normalizes them, and diffs
-  each environment against the baseline (`compare_baseline` in config, default
-  `libdev`) with `jd`. Optional `FILTER` is an egrep over the uid list
-  (e.g. `solr-compare '^places'`). Use `--av` to compare av-core docs (keyed by
-  `id`) instead.
-- **`solr-counts`** — document-count comparison: one row per `count_targets`
-  entry, one column per environment (`-` = core absent, `?` = query failed).
-- **`solr-idlists export [NAME_REGEX]`** — (re)generate the UID/ID lists that
-  `solr-compare` consumes, from `export_targets` in config.
-- **`entity-munge`** — Perl canonicalizer (decodes HTML entities, rewrites
-  hostnames/URLs) so docs from different environments compare equal. Edit its
-  regex list when the canonical form needs to change.
-- **`solr-lib.sh`** — shared helpers (sourced, not run directly).
-
-## Caching and data layout
-
-`solr-compare` reads idlists from `./idlists` and caches fetched docs and diffs
-in `./tmpout`; results go to `*.gdbm` databases. A document is skipped if its
-per-env JSON is already cached — delete `tmpout/<uid>-test-*.json` to force a
-refresh. These default to the current directory; override with `SOLR_IDLISTS`,
-`SOLR_TMPOUT`, and `SOLR_STATEDIR`. Run from the directory holding your data,
-or point the env vars at it. The generated `idlists/`, `tmpout/`, and `*.gdbm`
-are not tracked.
+Prints one row per `count_targets` entry and one column per environment
+(`-` = core absent in that environment, `?` = query failed). Requires `jq` and
+`curl`. Reaches the UVA-internal replicas only from a network that can resolve
+`*.internal.lib.virginia.edu`.

@@ -15,9 +15,3 @@ partial_results_*.json
 *_debug*.yml
 *_last.yml
 test-run
-
-# Solr comparison generated data (regenerate via uvalib/solr/solr-idlists)
-tmpout/
-idlists/
-*.gdbm
-*.gdbm-*
