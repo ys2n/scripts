@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mandala-logs — inspect CloudWatch logs for the Mandala ingest/Solr pipeline.
+#
+# Consolidates the old ad-hoc scripts (check-failures, check-queues,
+# check-solr-errors, tail-log) into one tool. Credentials come from aws-vault
+# (or the environment) — never hardcoded.
+#
+# Usage:
+#   mandala-logs list [SUBSTR]              List uva-mandala* log groups (optionally filtered)
+#   mandala-logs tail <GROUP> [--since T]   Live-follow a log group (default --since 2h)
+#   mandala-logs grep <GROUP> <PATTERN>     filter-log-events for PATTERN in a group
+#
+# GROUP may be a full log group name or a unique substring (resolved against
+# the uva-mandala* groups). Examples:
+#   mandala-logs tail kmassets-solr-update-production
+#   mandala-logs grep solr-master-staging ERROR
+#   mandala-logs grep kmassets-solr-update-production No
+#
+# Env:
+#   AWS_VAULT_PROFILE   aws-vault profile to use (default: staging)
+#   AWS_DEFAULT_REGION  AWS region (default: us-east-1)
+
+PROFILE="${AWS_VAULT_PROFILE:-staging}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+PREFIX="uva-mandala"
+
+# Run an aws command with credentials. Prefers creds already in the environment
+# (e.g. when invoked under `aws-vault exec`); otherwise falls back to aws-vault.
+# Mirrors the aws_run helper in ./alb-state.
+aws_run() {
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+    aws "$@"
+  elif command -v aws-vault &>/dev/null; then
+    aws-vault exec "$PROFILE" -- aws "$@"
+  else
+    aws "$@"
+  fi
+}
+
+list_groups() {
+  aws_run logs describe-log-groups --log-group-name-prefix="$PREFIX" \
+    | jq -r '.logGroups[].logGroupName'
+}
+
+# Resolve a full name or unique substring to a single log group name.
+resolve_group() {
+  local needle="$1" matches
+  matches="$(list_groups | grep -F -- "$needle" || true)"
+  if [[ -z "$matches" ]]; then
+    echo "No uva-mandala* log group matches: $needle" >&2
+    return 1
+  fi
+  if [[ "$(wc -l <<<"$matches")" -gt 1 ]]; then
+    echo "Ambiguous group '$needle' matches multiple groups:" >&2
+    sed 's/^/  /' <<<"$matches" >&2
+    return 1
+  fi
+  echo "$matches"
+}
+
+usage() { sed -n '4,23p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list)
+    if [[ -n "${1:-}" ]]; then list_groups | grep -F -- "$1"; else list_groups; fi
+    ;;
+  tail)
+    [[ -n "${1:-}" ]] || { echo "tail: GROUP required" >&2; exit 1; }
+    group="$(resolve_group "$1")"; shift
+    since="2h"
+    [[ "${1:-}" == "--since" ]] && { since="$2"; shift 2; }
+    echo "Tailing $group (since $since)..." >&2
+    aws_run logs tail --since "$since" --follow "$group"
+    ;;
+  grep)
+    [[ -n "${1:-}" && -n "${2:-}" ]] || { echo "grep: GROUP and PATTERN required" >&2; exit 1; }
+    group="$(resolve_group "$1")"
+    aws_run logs filter-log-events --log-group-name="$group" --filter-pattern="$2"
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2; echo >&2; usage >&2; exit 1
+    ;;
+esac
