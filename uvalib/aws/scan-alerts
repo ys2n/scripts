@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+#
+# scan-alerts — turn a CloudWatch alarm into the log lines behind it.
+#
+# When a "*-errors" (or any log-metric) alarm pages you, the alarm itself only
+# tells you a threshold was crossed -- it does not tell you *what* the errors
+# were, and by the time you look the alarm has usually self-cleared. This
+# script closes that gap for any uva-* site (library-drupal, mandala-drupal,
+# dh-drupal, ...):
+#
+#   1. Lists the alarms under a name prefix and, from each alarm's HISTORY
+#      (not just its current state), shows every time it flipped into ALARM in
+#      the lookback window -- with the datapoint value that tripped it. Alarms
+#      recover on their own, so the current state is almost always OK; the
+#      history is where the signal lives.
+#
+#   2. For log-metric alarms (namespace LogMetrics), it follows the chain
+#         alarm -> metric name -> metric filter -> log group + filter pattern
+#      and scans that log group over the whole window, then aggregates the
+#      matching lines by day, by HTTP referer, and by failing file:line.
+#
+# It scans with CloudWatch Logs Insights (start-query/get-query-results), not
+# `aws logs filter-log-events`: these log groups hold millions of records and
+# filter-log-events reliably times out over multi-day ranges, while Insights
+# scans the same data server-side in seconds.
+#
+# Requirements: awscli v2, python3, and AWS creds with cloudwatch:* / logs:*
+# read access. Credentials follow this repo's usual pattern (see mandala-logs,
+# alb-state): prefers creds already in the environment, otherwise falls back
+# to `aws-vault exec $AWS_VAULT_PROFILE`.
+#
+# Env:
+#   AWS_VAULT_PROFILE   aws-vault profile to use (default: staging)
+#   AWS_DEFAULT_REGION  AWS region (default: us-east-1)
+#
+# Examples:
+#   scan-alerts uva-library-drupal-production                    # last 7d
+#   scan-alerts -d 30 uva-library-drupal-production               # last 30 days
+#   scan-alerts -d 30 -q 'Allowed memory size' uva-library-drupal-production
+#   scan-alerts -d 1 uva-mandala-drupal-production
+#
+set -euo pipefail
+
+# --- Configuration / defaults -------------------------------------------------
+PREFIX=""                                 # alarm name prefix to scan (required)
+DAYS=7                                     # lookback window
+OVERRIDE_PATTERN=""                        # optional narrower Insights substring
+REGION_OPT=""                              # optional "--region <r>" passthrough
+PROFILE="${AWS_VAULT_PROFILE:-staging}"    # aws-vault profile, used only if needed
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+show_help() {
+    cat <<EOF
+Usage: $0 [-d DAYS] [-q PATTERN] [-r REGION] ALARM_NAME_PREFIX
+
+Options:
+  -d DAYS     Lookback window in days (default: $DAYS)
+  -q PATTERN  Override the log-scan substring. By default the substring is
+              derived from each alarm's metric filter (e.g. "php:error").
+              Pass e.g. -q 'Allowed memory size' to focus on OOM fatals.
+  -r REGION   AWS region (default: \$AWS_DEFAULT_REGION, i.e. $AWS_DEFAULT_REGION).
+  -h          Show this help.
+
+Environment:
+  AWS_VAULT_PROFILE   aws-vault profile to use if no AWS creds are already in
+                       the environment (default: staging).
+
+Arguments:
+  ALARM_NAME_PREFIX   Alarm name prefix to scan, e.g. uva-library-drupal-production
+EOF
+    exit "${1:-1}"
+}
+
+while getopts "d:q:r:h" opt; do
+    case $opt in
+        d) DAYS="$OPTARG" ;;
+        q) OVERRIDE_PATTERN="$OPTARG" ;;
+        r) REGION_OPT="--region $OPTARG" ;;
+        h) show_help 0 ;;
+        *) show_help 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+PREFIX="${1:-}"
+[[ -z "$PREFIX" ]] && show_help 1
+
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is required." >&2; exit 1; }
+
+# Portable epoch math (works on both macOS/BSD date and GNU date: we compute
+# the offset in shell rather than relying on `date -d`/`date -v` syntax).
+NOW_EPOCH=$(date +%s)
+START_EPOCH=$((NOW_EPOCH - DAYS * 86400))
+# ISO for the CloudWatch alarm-history API (UTC).
+START_ISO=$(python3 -c "import time,sys; print(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime($START_EPOCH)))")
+
+# Run an aws command with credentials. Prefers creds already in the
+# environment (e.g. when invoked under `aws-vault exec`); otherwise falls back
+# to aws-vault. Mirrors the aws_run helper in ./alb-state and ./mandala-logs.
+aws_run() {
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+    aws "$@"
+  elif command -v aws-vault &>/dev/null; then
+    aws-vault exec "$PROFILE" -- aws "$@"
+  else
+    aws "$@"
+  fi
+}
+
+# REGION_OPT is a plain string ("" or "--region <r>"), not an array: bash 3.2
+# (macOS) treats expanding an empty array under `set -u` as an unbound
+# variable, so a string we can safely leave unquoted here is more portable.
+aws_cw() { aws_run cloudwatch $REGION_OPT "$@"; }
+aws_logs() { aws_run logs $REGION_OPT "$@"; }
+
+echo "=================================================================="
+echo " Alert scan: prefix '$PREFIX'   window: last ${DAYS}d (since $START_ISO)"
+echo "=================================================================="
+
+# --- 1. Which alarms fired, and on what value --------------------------------
+# (Plain indexed arrays + while-read, no mapfile/associative arrays, so this
+# runs on the stock bash 3.2 that ships with macOS as well as bash 4+.)
+ALARMS=()
+while IFS= read -r a; do
+    [[ -n "$a" ]] && ALARMS+=("$a")
+done < <(aws_cw describe-alarms --alarm-name-prefix "$PREFIX" \
+    --query 'MetricAlarms[].AlarmName' --output text 2>/dev/null | tr '\t' '\n' | sort)
+
+if [[ ${#ALARMS[@]} -eq 0 ]]; then
+    echo "No alarms found under prefix '$PREFIX'. Check the name (and region)."
+    exit 1
+fi
+
+echo
+echo "### Alarm fire history (transitions into ALARM) ###"
+FIRED=()   # names of alarms that flipped to ALARM in-window
+for alarm in "${ALARMS[@]}"; do
+    # HistoryData carries the triggering datapoint & the threshold in force at
+    # the time -- which can differ from the alarm's *current* threshold, so we
+    # read it from history rather than assuming the current config applied.
+    hist=$(aws_cw describe-alarm-history --alarm-name "$alarm" \
+        --history-item-type StateUpdate --start-date "$START_ISO" \
+        --query 'AlarmHistoryItems[?contains(HistorySummary, `to ALARM`)].[Timestamp, HistorySummary]' \
+        --output text 2>/dev/null)
+    if [[ -n "$hist" ]]; then
+        FIRED+=("$alarm")
+        echo
+        echo ">> $alarm"
+        echo "$hist" | sed 's/^/     /'
+    fi
+done
+[[ ${#FIRED[@]} -eq 0 ]] && echo "  (no alarms in this prefix flipped to ALARM in the window)"
+
+# --- 2. For log-metric alarms, resolve log group + pattern and scan ----------
+# Scan the union of log groups behind the fired alarms. Fall back to (or, with
+# an explicit -q, always use) every log-metric alarm in the prefix: a fired
+# alarm may not be a log-metric alarm at all (e.g. a latency/ELB alarm fired
+# but the *-errors log alarm stayed quiet), and an explicit -q means the user
+# is directing a search, not just following whatever happened to fire.
+SCAN_SET=("${FIRED[@]}")
+if [[ ${#SCAN_SET[@]} -eq 0 || -n "$OVERRIDE_PATTERN" ]]; then
+    SCAN_SET=("${ALARMS[@]}")
+fi
+
+# Map alarm -> (log group, derived substring). Dedup log groups so we scan each
+# once over the full window. Kept as parallel indexed arrays (LG_KEYS[i] holds a
+# log group, LG_SUBS[i] its substring) to stay bash-3.2 compatible.
+LG_KEYS=()
+LG_SUBS=()
+lg_seen=""   # space-delimited list of already-recorded log groups
+for alarm in "${SCAN_SET[@]}"; do
+    read -r ns metric <<<"$(aws_cw describe-alarms --alarm-names "$alarm" \
+        --query 'MetricAlarms[0].[Namespace,MetricName]' --output text 2>/dev/null)"
+    [[ "$ns" != "LogMetrics" || -z "$metric" || "$metric" == "None" ]] && continue
+
+    # metric name -> metric filter -> log group + filter pattern
+    read -r lg fpat <<<"$(aws_logs describe-metric-filters \
+        --metric-name "$metric" --metric-namespace "$ns" \
+        --query 'metricFilters[0].[logGroupName,filterPattern]' --output text 2>/dev/null)"
+    [[ -z "$lg" || "$lg" == "None" ]] && continue
+
+    if [[ -n "$OVERRIDE_PATTERN" ]]; then
+        sub="$OVERRIDE_PATTERN"
+    else
+        # CloudWatch filter patterns for these alarms are a quoted literal like
+        # "php:error"; pull the text inside the first pair of quotes as the
+        # substring to search. Fall back to the raw pattern if unquoted.
+        sub=$(printf '%s' "$fpat" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+        [[ -z "$sub" ]] && sub="$fpat"
+    fi
+    # dedup: only record a log group the first time we see it
+    case " $lg_seen " in
+        *" $lg "*) : ;;
+        *) LG_KEYS+=("$lg"); LG_SUBS+=("$sub"); lg_seen="$lg_seen $lg" ;;
+    esac
+done
+
+if [[ ${#LG_KEYS[@]} -eq 0 ]]; then
+    echo
+    echo "No log-metric alarms to scan (nothing to correlate to a log group)."
+    exit 0
+fi
+
+# Escape a substring for use inside a Logs Insights /regex/ literal.
+regex_escape() { printf '%s' "$1" | sed 's/[.[\*^$()+?{|]/\\&/g; s:/:\\/:g'; }
+
+for i in "${!LG_KEYS[@]}"; do
+    lg="${LG_KEYS[$i]}"
+    sub="${LG_SUBS[$i]}"
+    rx=$(regex_escape "$sub")
+    echo
+    echo "=================================================================="
+    echo "### Log scan: $lg"
+    echo "###   matching /$sub/ over last ${DAYS}d"
+    echo "=================================================================="
+
+    qid=$(aws_logs start-query --log-group-name "$lg" \
+        --start-time "$START_EPOCH" --end-time "$NOW_EPOCH" \
+        --query-string "fields @timestamp, @message | filter @message like /$rx/ | sort @timestamp desc | limit 1000" \
+        --query 'queryId' --output text 2>/dev/null) || { echo "  (failed to start query)"; continue; }
+
+    # Poll for completion (Insights is async).
+    status="Running"
+    for _ in $(seq 1 60); do
+        status=$(aws_logs get-query-results --query-id "$qid" --query 'status' --output text 2>/dev/null || echo Failed)
+        [[ "$status" == "Complete" || "$status" == "Failed" || "$status" == "Cancelled" ]] && break
+        sleep 2
+    done
+    if [[ "$status" != "Complete" ]]; then
+        echo "  (query did not complete: status=$status)"
+        continue
+    fi
+
+    aws_logs get-query-results --query-id "$qid" --output json 2>/dev/null | python3 -c '
+import json, re, sys
+from collections import Counter
+data = json.load(sys.stdin)
+msgs = [f["value"] for row in data.get("results", []) for f in row if f["field"] == "@message"]
+print(f"  total matches: {len(msgs)}")
+if not msgs:
+    sys.exit(0)
+byday, ref, site = Counter(), Counter(), Counter()
+noref = 0
+for m in msgs:
+    d = re.match(r"([A-Z][a-z]{2}\s+\d+)", m)
+    if d: byday[d.group(1)] += 1
+    r = re.search(r"referer:\s*(\S+)", m)
+    if r: ref[r.group(1)] += 1
+    else: noref += 1
+    s = re.search(r"in (/\S+) on line (\d+)", m)
+    if s: site[f"{s.group(1)}:{s.group(2)}"] += 1
+def block(title, counter, extra=""):
+    print(f"\n  -- {title}{extra} --")
+    for k, v in (sorted(counter.items()) if title.startswith("by day") else counter.most_common(15)):
+        print(f"    {v:5d}  {k}")
+block("by day", byday)
+block("by referer", ref, f" (no referer: {noref})")
+if site: block("by failing file:line", site)
+print("\n  -- newest sample --")
+print("    " + msgs[0][:400])
+'
+done
+
+echo
+echo "Done."
