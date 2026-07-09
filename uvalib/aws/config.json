@@ -40,5 +40,20 @@
   "identities": {
     "emails": ["ys2n@virginia.edu"],
     "phones": ["+14342826613"]
+  },
+  "filters": {
+    "staging-pipelines": {
+      "subscription_arn": "arn:aws:sns:us-east-1:115119339709:uva-infrastructure-notice-staging:8a96e853-5ef8-4a35-9017-6543c1278758",
+      "field": "status",
+      "prefixes": [
+        "uva-drupal-dh-codepipeline",
+        "uva-drupal-dsf-codepipeline",
+        "uva-drupal-library-codepipeline",
+        "uva-drupal-library-release-codepipeline",
+        "uva-drupal-migrate-tools-codepipeline",
+        "uva-drupal-netbadge-codepipeline",
+        "uva-uva-drupal-theme-codepipeline"
+      ]
+    }
   }
 }

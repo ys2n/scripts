@@ -45,10 +45,23 @@ These patterns are shared deliberately; match them when adding or editing script
   `.sh` is reserved for sourced helpers / remote-execution templates. Scripts carry a
   usage header comment and `-h`/`--help`.
 
+- **Identity must be explicit and confirmed, never inferred.** In `uvalib/aws/`
+  notification tooling (`alert-config`), an email/phone is only ever treated as "the
+  operator" because it's listed verbatim in `config.json`'s `identities` block — never
+  because it shares a topic, or sits on a resource (rule, subscription) the operator's
+  own IAM user created. This was a real mistake caught mid-development: a phone number
+  was wrongly assumed to be the operator's because it was subscribed to the same SNS
+  topic as their confirmed email; it belonged to someone else. Apply the same
+  discipline to any future tooling that infers "whose is this" from AWS resource
+  ownership/proximity rather than an explicit, user-confirmed identity list.
+
 ## Areas
 
 - `uvalib/aws/` — AWS CLI monitoring/ops tools (CodePipeline, ALB target groups,
-  CloudWatch logs & alarm forensics). Richest design notes live in its README.
+  CloudWatch logs & alarm forensics, and `alarm-watch`/`alert-config` for CloudWatch
+  alarm and SNS/CodeStar notification filtering — see that directory's README for the
+  live notification setup and why it's configured the way it is). Richest design
+  notes live in its README.
 - `uvalib/solr/` — Mandala Solr cross-environment count drift check (`solr-counts`).
 - `uvalib/host/` — SSH-based Drupal/Mandala host admin (`collect-host-info`, `uvado`).
 - `uvalib/ansible/` — playbooks + `build-inventory` (inventory generated from the

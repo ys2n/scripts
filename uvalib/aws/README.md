@@ -20,7 +20,8 @@ AWS CLI scripts and monitoring tools for the UVA Library / Mandala fleet.
 - **`alert-config`** — account-wide `status` of every SNS subscription and
   CodeStar notification rule tied to `config.json`'s `identities` block, plus
   administration (subscribe/unsubscribe, enable/disable a rule, add/remove a
-  rule's SNS targets). See below for design notes.
+  rule's SNS targets, and a generalized `sync-filter` for any subscription via
+  `config.json`'s `filters` block). See below for design notes.
 
 All six share the same credential pattern: prefer AWS creds already in the
 environment, otherwise fall back to `aws-vault exec $AWS_VAULT_PROFILE` (env
@@ -164,6 +165,38 @@ aws sns list-subscriptions-by-topic \
 aws sns unsubscribe --subscription-arn OLD_EMAIL_JSON_SUBSCRIPTION_ARN
 ```
 
+## Current notification setup (as of this writing)
+
+A snapshot of what's actually live, for context — `alert-config status` is
+the authoritative up-to-date view; this just records *why* it looks the way
+it does, since that reasoning won't be visible from the live state alone.
+
+- **`uva-site-urgent-production`** (email-json, `ys2n@virginia.edu`) —
+  filtered by `alarm-watch sync-filter` to the 4 Drupal/Mandala production
+  sites (`library-drupal`, `mandala-drupal`, `dh-drupal`, `dsf-drupal`) ×
+  base/failed-login/reboot alarm templates. Started with **no filter at
+  all** — every alarm across ~350 unrelated apps on the account reached this
+  one inbox before this work.
+- **`uva-infrastructure-notice-staging`** (sms, confirmed cell) — filtered
+  by `alert-config sync-filter staging-pipelines` to 7 staging Drupal
+  CodePipeline pipelines (`dh`, `dsf`, `library`, `library-release`,
+  `migrate-tools`, `netbadge`, `theme`). `dhportal` deliberately excluded —
+  that project was handed off.
+- **`uva-drupal-dh-staging-codepipeline-notification-rule-ys2n`** (CodeStar
+  rule) — **disabled, not deleted.** Its 11 event types include
+  stage/action-level detail and pipeline-level `Canceled` that the
+  EventBridge-based filter above can't see (verified: no EventBridge rule
+  covers pipeline cancellation for this pipeline at all). Kept disabled
+  rather than removed specifically so that detail is one `rule-enable` away
+  if ever needed — e.g. if a manual-approval gate gets added to this
+  pipeline later (none exists today, so the rule's 3 manual-approval event
+  types can't currently fire regardless).
+- **`uva-drupal-notice-staging`** — subscription removed entirely (not just
+  filtered). This was the source of ~7-9 SMS/day, every day for a year+,
+  turned out to be a daily 6am staging-host reboot notice with no way to
+  filter out just that piece — the CodePipeline events it also carried are
+  now fully covered by the `uva-infrastructure-notice-staging` filter above.
+
 ## alert-config: design notes
 
 Built because `alarm-watch` only ever manages one thing (the `FilterPolicy` on
@@ -208,3 +241,22 @@ result back — a naive "set this one target" call would silently drop every
 other target the rule had. `rule-remove-target` also refuses outright if the
 result would be an empty target list (a notification rule with nowhere to
 notify); use `rule-disable` instead to silence a rule.
+
+**Why `sync-filter` is generalized (config.json's `filters` key), not
+hardcoded like alarm-watch's.** Investigating "where do my liked CodePipeline
+texts actually come from" turned up ~30 EventBridge rules (`aws.codepipeline`
+source, `CodePipeline Pipeline Execution State Change` detail-type) that
+format a plain `{"status": "<pipeline> has <state>"}` message and fan each
+one out to four different SNS topics at once — including
+`uva-infrastructure-notice-staging`, which turned out to already carry
+*every* staging pipeline's events account-wide (confirmed: the unrelated
+EMMA project's pipeline fires into it too), with none of the reboot/instance-
+stop noise (that goes to `uva-site-notice-staging`/`cloudwatch-alarm-active`
+instead). Subscribing there and filtering by `status` prefix — same
+`FilterPolicyScope=MessageBody` mechanism as alarm-watch, just matching a
+different field — got the desired 7 staging Drupal pipelines with zero new
+EventBridge rules. `filters.<name>` in config.json bundles a
+`subscription_arn`, the message `field` to match on, and the allowed
+`prefixes`, so the same `sync-filter <name> [--apply]` command works for any
+subscription/field pair rather than being locked to one topic and
+`AlarmName`, the way alarm-watch's version is.

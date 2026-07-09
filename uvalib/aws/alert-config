@@ -27,11 +27,22 @@ set -euo pipefail
 #   alert-config rule-disable <rule-name-or-arn>             Disable a CodeStar notification rule
 #   alert-config rule-add-target <rule> <topic-arn>          Add an SNS target to a rule
 #   alert-config rule-remove-target <rule> <topic-arn>       Remove an SNS target from a rule
+#   alert-config sync-filter <filter-name> [--apply]         Diff/apply a named FilterPolicy (see below)
 #
 # Config (uvalib/aws/config.json, "identities" key):
 #   emails   email addresses confirmed to be you
 #   phones   phone numbers confirmed to be you -- add one only once you've
 #            verified it yourself; this script will never add or infer one
+#
+# Config ("filters" key) -- named FilterPolicy specs for sync-filter, generalizing
+# alarm-watch's sync-filter (which is hardcoded to one subscription and the
+# AlarmName field) to any subscription and any top-level message field:
+#   filters.<name>.subscription_arn   the subscription to manage
+#   filters.<name>.field              JSON field in the message body to match on
+#                                      (e.g. "status" for EventBridge-originated
+#                                      CodePipeline notices, "AlarmName" for
+#                                      CloudWatch alarms)
+#   filters.<name>.prefixes           allowed prefix values for that field
 #
 # Env:
 #   AWS_VAULT_PROFILE   aws-vault profile to use (default: staging)
@@ -42,6 +53,7 @@ set -euo pipefail
 #   alert-config unsubscribe arn:aws:sns:us-east-1:115119339709:some-topic:sub-id
 #   alert-config rule-disable uva-drupal-dh-staging-codepipeline-notification-rule-ys2n
 #   alert-config rule-add-target my-rule arn:aws:sns:us-east-1:115119339709:some-topic
+#   alert-config sync-filter staging-pipelines --apply
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
@@ -63,7 +75,7 @@ aws_run() {
 aws_sns()      { aws_run sns "$@"; }
 aws_codestar() { aws_run codestar-notifications "$@"; }
 
-usage() { sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed -n '21,56p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
 [[ -f "$CONFIG_FILE" ]] || { echo "No config.json found at $CONFIG_FILE" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq is required." >&2; exit 1; }
@@ -238,12 +250,20 @@ cmd_subscribe() {
   read -r CONFIRM
   [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
 
-  aws_sns subscribe --topic-arn "$TOPIC_ARN" --protocol "$PROTOCOL" --notification-endpoint "$ENDPOINT"
+  local NEW_ARN
+  NEW_ARN="$(aws_sns subscribe --topic-arn "$TOPIC_ARN" --protocol "$PROTOCOL" \
+    --notification-endpoint "$ENDPOINT" --query 'SubscriptionArn' --output text)"
 
   echo
   case "$PROTOCOL" in
-    email|email-json) echo "Subscription created (pending). Check $ENDPOINT for a confirmation link." ;;
-    *)                echo "Subscription created." ;;
+    email|email-json)
+      echo "Subscription created (pending). Check $ENDPOINT for a confirmation link."
+      echo "SubscriptionArn will only be final once confirmed -- re-check via 'status' after."
+      ;;
+    *)
+      echo "Subscription created."
+      echo "SubscriptionArn: $NEW_ARN"
+      ;;
   esac
 }
 
@@ -371,6 +391,86 @@ cmd_rule_retarget() {
 }
 
 # ---------------------------------------------------------------------------
+# sync-filter: diff/apply a named FilterPolicy (config.json's "filters" key).
+# Generalizes alarm-watch's sync-filter (hardcoded to one subscription and the
+# AlarmName field) to any subscription and any top-level message field.
+# ---------------------------------------------------------------------------
+cmd_sync_filter() {
+  local NAME="${1:-}" APPLY=0
+  [[ "${2:-}" == "--apply" ]] && APPLY=1
+  if [[ -z "$NAME" ]]; then
+    echo "Usage: $0 sync-filter <filter-name> [--apply]" >&2
+    exit 1
+  fi
+
+  local SPEC
+  SPEC="$(jq -c --arg n "$NAME" '.filters[$n] // empty' "$CONFIG_FILE")"
+  if [[ -z "$SPEC" ]]; then
+    echo "No filters.$NAME configured in $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  local SUB_ARN FIELD
+  SUB_ARN="$(jq -r '.subscription_arn // empty' <<<"$SPEC")"
+  FIELD="$(jq -r '.field // empty' <<<"$SPEC")"
+  if [[ -z "$SUB_ARN" || -z "$FIELD" ]]; then
+    echo "filters.$NAME must set both subscription_arn and field in $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  # Desired policy: {FIELD: [{"prefix": p1}, {"prefix": p2}, ...]}. Same
+  # FilterPolicyScope=MessageBody requirement as alarm-watch's sync-filter --
+  # these EventBridge-originated messages don't set SNS message attributes either.
+  local DESIRED
+  DESIRED="$(jq -c --arg f "$FIELD" '{($f): (.prefixes | map({prefix: .}))}' <<<"$SPEC")"
+
+  local CURRENT
+  CURRENT="$(aws_sns get-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --query 'Attributes.FilterPolicy' --output text 2>/dev/null || echo "None")"
+  [[ "$CURRENT" == "None" || -z "$CURRENT" ]] && CURRENT="{}"
+  CURRENT="$(jq -c . <<<"$CURRENT" 2>/dev/null || echo "{}")"
+
+  echo "Filter: $NAME"
+  echo "Subscription: $SUB_ARN"
+  echo
+  echo "Current FilterPolicy:"
+  jq . <<<"$CURRENT" | sed 's/^/  /'
+  echo
+  echo "Desired FilterPolicy (from filters.$NAME.prefixes):"
+  jq . <<<"$DESIRED" | sed 's/^/  /'
+  echo
+
+  if [[ "$CURRENT" == "$DESIRED" ]]; then
+    echo "Already in sync -- nothing to do."
+    return 0
+  fi
+
+  if [[ "$APPLY" -eq 0 ]]; then
+    echo "(dry run -- re-run with --apply to push this change)"
+    return 0
+  fi
+
+  echo "============================================================"
+  echo " CONFIRMATION REQUIRED"
+  echo "============================================================"
+  echo
+  echo "This changes which messages reach:"
+  echo "  $SUB_ARN"
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
+
+  aws_sns set-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --attribute-name FilterPolicyScope --attribute-value MessageBody
+  aws_sns set-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --attribute-name FilterPolicy --attribute-value "$DESIRED"
+
+  echo
+  echo "Applied."
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 case "${1:-status}" in
@@ -381,6 +481,7 @@ case "${1:-status}" in
   rule-disable)        shift; cmd_rule_set_status DISABLED "$@" ;;
   rule-add-target)     shift; cmd_rule_retarget add "$@" ;;
   rule-remove-target)  shift; cmd_rule_retarget remove "$@" ;;
+  sync-filter)         shift; cmd_sync_filter "$@" ;;
   -h|--help)           usage 0 ;;
   *)                   echo "Unknown command: $1" >&2; usage 1 ;;
 esac
