@@ -18,5 +18,27 @@
       "profile": "staging",
       "target_group": "alb-dsf-drupal-production"
     }
+  },
+  "notifications": {
+    "topic_arn": "arn:aws:sns:us-east-1:115119339709:uva-site-urgent-production",
+    "subscription_arn": "arn:aws:sns:us-east-1:115119339709:uva-site-urgent-production:b45cd604-0148-4598-a692-04552696ef05",
+    "services": [
+      "library-drupal",
+      "mandala-drupal",
+      "dh-drupal",
+      "dsf-drupal"
+    ],
+    "environments": [
+      "production"
+    ],
+    "prefix_templates": [
+      "uva-{service}-{environment}",
+      "uva-failed-login-{service}-{environment}",
+      "uva-reboot-{service}-{environment}"
+    ]
+  },
+  "identities": {
+    "emails": ["ys2n@virginia.edu"],
+    "phones": ["+14342826613"]
   }
 }

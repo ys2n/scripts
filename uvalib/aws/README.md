@@ -13,8 +13,16 @@ AWS CLI scripts and monitoring tools for the UVA Library / Mandala fleet.
 - **`scan-alerts`** — given a CloudWatch alarm name prefix, show recent ALARM
   transitions and, for log-metric alarms, scan the backing log group and
   aggregate the hits. See below for the design rationale.
+- **`alarm-watch`** — digest of current/recent alarm state across the sites in
+  `config.json`'s `notifications` block, a `discover` command to browse what's
+  available, and a `sync-filter` command to narrow your SNS subscription to just
+  those sites. See below for design notes.
+- **`alert-config`** — account-wide `status` of every SNS subscription and
+  CodeStar notification rule tied to `config.json`'s `identities` block, plus
+  administration (subscribe/unsubscribe, enable/disable a rule, add/remove a
+  rule's SNS targets). See below for design notes.
 
-All four share the same credential pattern: prefer AWS creds already in the
+All six share the same credential pattern: prefer AWS creds already in the
 environment, otherwise fall back to `aws-vault exec $AWS_VAULT_PROFILE` (env
 var, default `staging`).
 
@@ -69,3 +77,134 @@ different failure mode than what the interactive shell sees. This is why
 `scan-alerts` (and `alb-state`/`mandala-logs` before it) implement `aws_run`
 explicitly rather than relying on the caller's shell aliasing to paper over
 auth.
+
+## alarm-watch: design notes
+
+Built after discovering that the personal SNS subscription behind these alarm
+emails (`uva-site-urgent-production`, protocol `email-json`) had **no
+`FilterPolicy` at all** — over 350 alarms across dozens of unrelated apps
+(not just the Drupal/Mandala fleet the rest of this directory targets) were
+all reaching one inbox, unfiltered, as double-JSON-wrapped email. `alarm-watch`
+addresses both halves: what AWS actually sends you, and how you check on
+things without relying on email at all.
+
+**Why `services` x `environments` x `prefix_templates`, not a flat prefix list.**
+The first version stored full prefixes directly (`uva-library-drupal-production`)
+and used them for both CloudWatch polling and the SNS `FilterPolicy`. Running
+`alarm-watch discover` against the live account after applying that filter showed
+it was already wrong: `uva-failed-login-<service>-<env>` and
+`uva-reboot-<service>-<env>` alarms put their category *before* the service name,
+so a per-service prefix silently missed them — the just-applied filter was
+dropping security (failed-login) and availability (reboot) alerts for every
+configured site. `services` (bare identifiers), `environments` (naming tokens),
+and `prefix_templates` (patterns with `{service}`/`{environment}` placeholders)
+are now three separate, crossed lists, so a new alarm-naming shape only needs a
+new template, applied uniformly to every service — not a manual prefix added per
+service per category. `alarm-watch discover <substring>` exists specifically to
+catch the next one of these before assuming a service is fully covered.
+
+**Why `environments` doesn't change what `sync-filter` can actually deliver.**
+staging/develop alarms publish to entirely different SNS topics than production
+(e.g. `uva-site-notice-staging`, confirmed via `describe-alarms` on a staging
+alarm's `AlarmActions` — not `uva-site-urgent-production`). Adding `"staging"` to
+`environments` immediately makes `alarm-watch`'s own polling show staging alarm
+state (no topic dependency — `describe-alarms --alarm-name-prefix` doesn't care
+what a matched alarm's actions point to), but `sync-filter` only ever manages the
+one `subscription_arn`/`topic_arn` pair in config — staging-shaped prefixes added
+to that FilterPolicy are inert until there's a separate subscription on staging's
+own topic, which this script doesn't create.
+
+**Why `FilterPolicyScope=MessageBody`, not the default `MessageAttributes`.**
+CloudWatch alarm actions publish to SNS without setting any message
+attributes — the `AlarmName` field lives only in the JSON message body. The
+default attribute-scoped filtering has nothing to match against, so the
+subscription attribute has to be set explicitly to `MessageBody` before the
+`FilterPolicy` (matching `AlarmName` by `prefix`) has any effect. Confirmed via
+`aws sns set-subscription-attributes help`.
+
+**Why `sync-filter` only ever touches one subscription ARN.** The topic has
+multiple independent subscribers (`lib-aws-prod-support@...`, an SMS number,
+etc.). `sync-filter` reads `notifications.subscription_arn` from config and
+calls `set-subscription-attributes` against that ARN only — verified it's a
+distinct, personally-owned subscription (`SubscriptionPrincipal` is your own
+IAM user), so narrowing it can't affect what anyone else receives.
+
+**Why `sync-filter` is diff-then-confirm, never automatic.** It prints current
+vs. desired `FilterPolicy` and only pushes with an explicit `--apply`, gated by
+a typed `yes` — the same confirmation pattern `alb-state` uses before
+registering/deregistering ALB targets. This is a change to live, shared-account
+notification routing; it shouldn't happen as a side effect of an unrelated run.
+
+**Why the `email-json` → `email` protocol switch isn't scripted.** That's what
+actually produces the double-JSON-wrapped envelope (the whole SNS `Notification`
+object, `Message` field escaped inside it) instead of just the CloudWatch
+alarm JSON. Fixing it means creating a *new* subscription and clicking the
+confirmation link AWS emails you — a step no script can complete on your
+behalf. Scripting "unsubscribe old, subscribe new" around that manual click
+risks leaving you with zero working subscriptions if the confirmation email is
+missed or delayed. Do it by hand, once:
+
+```sh
+# 1. Subscribe a new plain-email endpoint (keeps the old one active for now)
+aws sns subscribe --topic-arn "$(jq -r .notifications.topic_arn config.json)" \
+  --protocol email --notification-endpoint ys2n@virginia.edu
+
+# 2. Check email, click the "Confirm subscription" link.
+
+# 3. Find the new subscription's ARN, and point config.json at it
+aws sns list-subscriptions-by-topic \
+  --topic-arn "$(jq -r .notifications.topic_arn config.json)" \
+  --query "Subscriptions[?Endpoint=='ys2n@virginia.edu']"
+# -> update notifications.subscription_arn in config.json to the new ARN
+
+# 4. Move the filter onto the new subscription (it starts with none)
+./alarm-watch sync-filter --apply
+
+# 5. Remove the old email-json subscription
+aws sns unsubscribe --subscription-arn OLD_EMAIL_JSON_SUBSCRIPTION_ARN
+```
+
+## alert-config: design notes
+
+Built because `alarm-watch` only ever manages one thing (the `FilterPolicy` on
+one SNS subscription); the actual ask was "show me everything I'm wired into,
+account-wide, so I can decide to cancel or add." Live discovery turned up a
+CodeStar Notification Rule (`codestar-notifications` — a different AWS
+service from CloudWatch/SNS alarms entirely, watching CodePipeline for
+`uva-drupal-dh-codepipeline`) that nothing else here touches, plus a second
+SNS subscription (`uva-drupal-notice-staging`) on the same confirmed phone
+number that neither of us knew about until `status` found it by scanning
+account-wide instead of trusting a fixed list.
+
+**Why identity must be explicit and confirmed, never inferred — the whole
+design pivots on a mistake.** The first pass at this treated a phone number
+as "yours" because it was subscribed to the same topics as your (actually
+yours) email address. You corrected that: the number belonged to someone
+else entirely. A second phone number, found as a CodeStar rule's SMS target,
+looked equally plausible for the same bad reasons (the rule's name contained
+"ys2n", its `CreatedBy` was your IAM user) — but was only actually confirmed
+when you stated it directly, in words. Proximity to something you own —
+sharing a topic, being the target of a rule you created — is not proof of
+endpoint ownership. `identities.emails`/`identities.phones` in `config.json`
+are the *only* source of truth `alert-config` will ever treat as "you," and
+nothing in the script adds to that list automatically. `status` labels every
+resolved endpoint `[confirmed: you]` or `[unverified endpoint]` on an exact
+match against that list — never a warning, just the honest default.
+
+**Why rule ownership (`CreatedBy`) and endpoint identity are tracked
+separately, not conflated.** `CreatedBy` matching your IAM `UserId` is real,
+provable evidence that *you created a given CodeStar notification rule* —
+unlike a phone number, nobody else's credentials could produce that field.
+It's used to decide which rules `status` shows you at all. But it says
+nothing about who the rule notifies; that's `identities` verification's job,
+applied independently to each of the rule's targets.
+
+**Why `--targets` on `update-notification-rule` is fetch-modify-replace, not
+additive.** Confirmed via `aws codestar-notifications update-notification-rule
+help`: `--targets` replaces the rule's entire target list. `rule-add-target`/
+`rule-remove-target` therefore always `describe-notification-rule` first, add
+or remove exactly one entry from the current list, and push the complete
+result back — a naive "set this one target" call would silently drop every
+other target the rule had. `rule-remove-target` also refuses outright if the
+result would be an empty target list (a notification rule with nowhere to
+notify); use `rule-disable` instead to silence a rule.

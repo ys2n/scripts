@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# alarm-watch — poll CloudWatch alarm state across configured uva-* site prefixes,
+# and manage the SNS subscription filter that controls which alarms email you.
+#
+# Two purposes:
+#   1. (default) A digest of current + recently-fired alarm state across the sites
+#      configured in config.json -- polls CloudWatch directly, no email/Gmail
+#      involved. Complements scan-alerts: this shows *what's alarming* across your
+#      sites; scan-alerts explains *why* (log correlation) for one prefix at a time.
+#   2. `sync-filter` reconciles your personal SNS subscription's FilterPolicy against
+#      that same site list, so only alarms for sites you've configured actually reach
+#      your inbox. Diff-only by default; --apply pushes the change (after a typed
+#      confirmation).
+#
+# A site isn't just "uva-<service>-production": alarm categories like failed-login
+# and reboot checks put the category *before* the service name instead
+# (uva-failed-login-<service>-<env>, uva-reboot-<service>-<env>), so a single prefix
+# per service would silently miss them. config.json instead lists `services` (bare
+# identifiers, e.g. "library-drupal"), `environments` (naming tokens as CloudWatch
+# spells them: "production", "staging", "develop" -- "develop", not "development" or
+# "dev"; same vocabulary alb-state's environment inference uses), and
+# `prefix_templates` ("uva-{service}-{environment}",
+# "uva-failed-login-{service}-{environment}", ...). Every services x environments x
+# templates combination becomes a watched/allowed prefix. Use
+# `alarm-watch discover <substring>` to check a service for alarms your templates
+# don't cover before assuming you're done.
+#
+# staging/develop alarms publish to entirely separate SNS topics from production
+# (e.g. uva-site-notice-staging, not uva-site-urgent-production) -- adding a
+# non-production environment lets `alarm-watch`'s own polling (status/-d/discover)
+# see those alarms, but has no effect on `sync-filter`, which only ever manages the
+# one subscription_arn/topic_arn pair in config.json (production urgent, today). To
+# also get staging/dev alarms by email you'd need a separate subscription on their
+# topic(s) -- not something this script manages.
+#
+# Usage:
+#   alarm-watch [-a|--all] [-d DAYS]     Show alarm status across configured sites
+#   alarm-watch discover [SUBSTRING]     List every alarm wired to the topic (browse
+#                                        what's available to add), optionally filtered
+#   alarm-watch sync-filter [--apply]    Diff/apply the SNS subscription filter
+#
+# Options:
+#   -a, --all   Also show alarms currently OK/INSUFFICIENT_DATA (default: firing only)
+#   -d DAYS     Also show alarms that fired (and may have self-cleared) in the last
+#               DAYS days, via alarm history -- catches things a snapshot would miss.
+#
+# Config (uvalib/aws/config.json, "notifications" key):
+#   topic_arn          SNS topic the alarms publish to
+#   subscription_arn   your subscription on that topic (sync-filter's target)
+#   services           bare service identifiers, e.g. "library-drupal"
+#   environments       naming tokens, e.g. "production", "staging", "develop"
+#   prefix_templates   patterns with {service}/{environment} placeholders, e.g.
+#                      "uva-{service}-{environment}"
+#
+# Env:
+#   AWS_VAULT_PROFILE   aws-vault profile to use (default: staging)
+#   AWS_DEFAULT_REGION  AWS region (default: us-east-1)
+#
+# Examples:
+#   alarm-watch                       # currently-firing alarms across configured sites
+#   alarm-watch -a                    # include OK/INSUFFICIENT_DATA too
+#   alarm-watch -d 3                  # also show alarms that fired in the last 3 days
+#   alarm-watch sync-filter           # show what would change on your subscription
+#   alarm-watch sync-filter --apply   # push the filter policy (asks for confirmation)
+#
+# For a deep dive on a specific alarm (log correlation), use:
+#   scan-alerts -d N <alarm-name-prefix>
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+PROFILE="${AWS_VAULT_PROFILE:-staging}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+# Run an aws command with credentials. Prefers creds already in the environment
+# (e.g. when invoked under `aws-vault exec`); otherwise falls back to aws-vault.
+# Mirrors the aws_run helper in ./alb-state, ./mandala-logs, ./scan-alerts.
+aws_run() {
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+    aws "$@"
+  elif command -v aws-vault &>/dev/null; then
+    aws-vault exec "$PROFILE" -- aws "$@"
+  else
+    aws "$@"
+  fi
+}
+aws_cw()  { aws_run cloudwatch "$@"; }
+aws_sns() { aws_run sns "$@"; }
+
+usage() { sed -n '38,67p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+[[ -f "$CONFIG_FILE" ]] || { echo "No config.json found at $CONFIG_FILE" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required." >&2; exit 1; }
+
+# Load configured services + environments + prefix templates into plain indexed
+# arrays (bash-3.2 safe: no mapfile, no associative arrays -- same technique as
+# scan-alerts), then expand every services x environments x templates combination
+# into the watched/allowed prefix list.
+SERVICES=()
+while IFS= read -r s; do
+  [[ -n "$s" ]] && SERVICES+=("$s")
+done < <(jq -r '.notifications.services[]? // empty' "$CONFIG_FILE")
+
+ENVIRONMENTS=()
+while IFS= read -r e; do
+  [[ -n "$e" ]] && ENVIRONMENTS+=("$e")
+done < <(jq -r '.notifications.environments[]? // empty' "$CONFIG_FILE")
+
+TEMPLATES=()
+while IFS= read -r t; do
+  [[ -n "$t" ]] && TEMPLATES+=("$t")
+done < <(jq -r '.notifications.prefix_templates[]? // empty' "$CONFIG_FILE")
+
+if [[ ${#SERVICES[@]} -eq 0 || ${#ENVIRONMENTS[@]} -eq 0 || ${#TEMPLATES[@]} -eq 0 ]]; then
+  echo "notifications.services, notifications.environments, and" >&2
+  echo "notifications.prefix_templates must all be configured in $CONFIG_FILE" >&2
+  exit 1
+fi
+
+SITE_PREFIXES=()
+for svc in "${SERVICES[@]}"; do
+  for env in "${ENVIRONMENTS[@]}"; do
+    for tmpl in "${TEMPLATES[@]}"; do
+      prefix="${tmpl//\{service\}/$svc}"
+      prefix="${prefix//\{environment\}/$env}"
+      SITE_PREFIXES+=("$prefix")
+    done
+  done
+done
+
+# ---------------------------------------------------------------------------
+# discover: list every alarm wired to the topic, annotated with current coverage.
+# The universe of alarms a site_prefixes entry could ever let through -- alarms
+# not on this topic at all can't reach you regardless of FilterPolicy.
+# ---------------------------------------------------------------------------
+cmd_discover() {
+  local FILTER="${1:-}"
+
+  local TOPIC_ARN
+  TOPIC_ARN="$(jq -r '.notifications.topic_arn // empty' "$CONFIG_FILE")"
+  if [[ -z "$TOPIC_ARN" ]]; then
+    echo "No notifications.topic_arn configured in $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  echo "Alarms wired to: $TOPIC_ARN"
+  [[ -n "$FILTER" ]] && echo "Filter: $FILTER"
+  echo
+
+  local ALL
+  ALL="$(aws_cw describe-alarms \
+    --query "MetricAlarms[?contains(AlarmActions, \`$TOPIC_ARN\`)].AlarmName" \
+    --output text 2>/dev/null | tr '\t' '\n' | sort)"
+
+  if [[ -n "$FILTER" ]]; then
+    ALL="$(grep -i -- "$FILTER" <<<"$ALL" || true)"
+  fi
+
+  if [[ -z "$ALL" ]]; then
+    echo "(no matching alarms)"
+    return 0
+  fi
+
+  local COVERED=0 TOTAL=0
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    (( TOTAL++ )) || true
+    local tag=""
+    for p in "${SITE_PREFIXES[@]}"; do
+      case "$name" in
+        "$p"*) tag=" [covered by: $p]"; (( COVERED++ )) || true; break ;;
+      esac
+    done
+    printf "  %-65s%s\n" "$name" "$tag"
+  done <<< "$ALL"
+
+  echo
+  echo "$COVERED/$TOTAL shown alarm(s) already covered by configured"
+  echo "services/environments/templates."
+  echo
+  echo "To start receiving a new service's alarms: add its bare identifier (e.g."
+  echo "\"dataverse\") to notifications.services in $CONFIG_FILE, then run"
+  echo "'$0 discover <service>' again to check for alarms that don't match any"
+  echo "configured prefix_templates (e.g. a category-prefixed name like"
+  echo "uva-failed-login-<service>-<env>) before running:"
+  echo "  $0 sync-filter --apply"
+}
+
+# ---------------------------------------------------------------------------
+# sync-filter: reconcile the SNS subscription's FilterPolicy with the expanded
+# SITE_PREFIXES (services x prefix_templates)
+# ---------------------------------------------------------------------------
+cmd_sync_filter() {
+  local APPLY=0
+  [[ "${1:-}" == "--apply" ]] && APPLY=1
+
+  local SUB_ARN
+  SUB_ARN="$(jq -r '.notifications.subscription_arn // empty' "$CONFIG_FILE")"
+  if [[ -z "$SUB_ARN" ]]; then
+    echo "No notifications.subscription_arn configured in $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  # Desired policy: {"AlarmName": [{"prefix": p1}, {"prefix": p2}, ...]} built from
+  # the expanded SITE_PREFIXES (services x prefix_templates), not read directly off
+  # config.json -- the JSON only stores the two factors, not their cross product.
+  # FilterPolicyScope=MessageBody is required here: CloudWatch alarm actions don't
+  # set SNS message attributes, so the default MessageAttributes-scoped filtering
+  # has nothing to match against -- the AlarmName field lives in the message body.
+  local DESIRED
+  DESIRED="$(printf '%s\n' "${SITE_PREFIXES[@]}" | jq -R . | jq -s -c '{AlarmName: map({prefix: .})}')"
+
+  local CURRENT
+  CURRENT="$(aws_sns get-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --query 'Attributes.FilterPolicy' --output text 2>/dev/null || echo "None")"
+  [[ "$CURRENT" == "None" || -z "$CURRENT" ]] && CURRENT="{}"
+  CURRENT="$(jq -c . <<<"$CURRENT" 2>/dev/null || echo "{}")"
+
+  echo "Subscription: $SUB_ARN"
+  echo
+  echo "Current FilterPolicy:"
+  jq . <<<"$CURRENT" | sed 's/^/  /'
+  echo
+  echo "Desired FilterPolicy (from site_prefixes):"
+  jq . <<<"$DESIRED" | sed 's/^/  /'
+  echo
+
+  if [[ "$CURRENT" == "$DESIRED" ]]; then
+    echo "Already in sync -- nothing to do."
+    return 0
+  fi
+
+  if [[ "$APPLY" -eq 0 ]]; then
+    echo "(dry run -- re-run with --apply to push this change)"
+    return 0
+  fi
+
+  echo "============================================================"
+  echo " CONFIRMATION REQUIRED"
+  echo "============================================================"
+  echo
+  echo "This changes which alarms email the endpoint behind:"
+  echo "  $SUB_ARN"
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "Cancelled."
+    exit 1
+  fi
+
+  aws_sns set-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --attribute-name FilterPolicyScope --attribute-value MessageBody
+  aws_sns set-subscription-attributes --subscription-arn "$SUB_ARN" \
+    --attribute-name FilterPolicy --attribute-value "$DESIRED"
+
+  echo
+  echo "Applied. Only alarms matching site_prefixes will reach this subscription."
+}
+
+# ---------------------------------------------------------------------------
+# status (default): current alarm state, optionally + recent fire history
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local SHOW_ALL=0 DAYS=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all) SHOW_ALL=1; shift ;;
+      -d) DAYS="${2:?-d requires a number of days}"; shift 2 ;;
+      -h|--help) usage 0 ;;
+      *) echo "Unknown argument: $1" >&2; usage 1 ;;
+    esac
+  done
+
+  echo "=================================================================="
+  echo " Alarm watch: ${#SITE_PREFIXES[@]} site prefix(es)   $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=================================================================="
+  echo
+  printf "  %-8s %-55s %-30s %s\n" "STATE" "ALARM" "UPDATED" "REASON"
+  echo "  ------------------------------------------------------------------------------------------------------------------"
+
+  local FIRING=0 OK_COUNT=0
+  for prefix in "${SITE_PREFIXES[@]}"; do
+    local ROWS
+    ROWS="$(aws_cw describe-alarms --alarm-name-prefix "$prefix" \
+      --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp,StateReason]' \
+      --output text 2>/dev/null)"
+    [[ -z "$ROWS" ]] && continue
+
+    while IFS=$'\t' read -r NAME STATE UPDATED REASON; do
+      [[ -z "$NAME" ]] && continue
+      if [[ "$STATE" == "ALARM" ]]; then
+        (( FIRING++ )) || true
+        printf "  %-8s %-55s %-30s %s\n" "$STATE" "$NAME" "$UPDATED" "${REASON:0:80}"
+      elif [[ "$SHOW_ALL" -eq 1 ]]; then
+        printf "  %-8s %-55s %-30s %s\n" "$STATE" "$NAME" "$UPDATED" "${REASON:0:80}"
+      else
+        (( OK_COUNT++ )) || true
+      fi
+    done <<< "$ROWS"
+  done
+
+  echo
+  [[ "$FIRING" -eq 0 ]] && echo "  No alarms currently firing across configured sites."
+  [[ "$SHOW_ALL" -eq 0 && "$OK_COUNT" -gt 0 ]] && echo "  ($OK_COUNT other alarm(s) OK -- use -a to show)"
+
+  if [[ "$DAYS" -gt 0 ]]; then
+    command -v python3 >/dev/null 2>&1 || { echo "python3 is required for -d/history" >&2; exit 1; }
+    local NOW_EPOCH START_EPOCH START_ISO
+    NOW_EPOCH=$(date +%s)
+    START_EPOCH=$((NOW_EPOCH - DAYS * 86400))
+    START_ISO=$(python3 -c "import time; print(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime($START_EPOCH)))")
+
+    echo
+    echo "### Alarms that fired in the last ${DAYS}d (including self-cleared) ###"
+    local ANY=0
+    for prefix in "${SITE_PREFIXES[@]}"; do
+      local NAMES
+      NAMES="$(aws_cw describe-alarms --alarm-name-prefix "$prefix" \
+        --query 'MetricAlarms[].AlarmName' --output text 2>/dev/null | tr '\t' '\n')"
+      [[ -z "$NAMES" ]] && continue
+
+      while IFS= read -r alarm; do
+        [[ -z "$alarm" ]] && continue
+        local hist
+        hist="$(aws_cw describe-alarm-history --alarm-name "$alarm" \
+          --history-item-type StateUpdate --start-date "$START_ISO" \
+          --query 'AlarmHistoryItems[?contains(HistorySummary, `to ALARM`)].[Timestamp, HistorySummary]' \
+          --output text 2>/dev/null)"
+        if [[ -n "$hist" ]]; then
+          ANY=1
+          echo
+          echo ">> $alarm"
+          echo "$hist" | sed 's/^/     /'
+        fi
+      done <<< "$NAMES"
+    done
+    [[ "$ANY" -eq 0 ]] && echo "  (none)"
+  fi
+
+  echo
+  echo "For log correlation on a specific alarm: scan-alerts -d N <alarm-name-prefix>"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  discover)    shift; cmd_discover "$@" ;;
+  sync-filter) shift; cmd_sync_filter "$@" ;;
+  -h|--help)   usage 0 ;;
+  *)           cmd_status "$@" ;;
+esac

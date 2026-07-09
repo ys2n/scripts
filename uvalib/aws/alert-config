@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# alert-config — account-wide view + administration of notification configs tied
+# to your confirmed identities, across both SNS subscriptions and CodeStar
+# Notification Rules (CodePipeline/CodeBuild) -- two separate AWS services that
+# alarm-watch (which only manages one SNS subscription's alarm filter) doesn't
+# touch.
+#
+# Two different, non-interchangeable questions, kept visually distinct in status:
+#   "Did I create/own this config?" -- CodeStar rules: proven via CreatedBy
+#     matching your IAM UserId.
+#   "Is this endpoint actually me?" -- proven ONLY by exact match against
+#     config.json's identities.emails/identities.phones. NEVER inferred from a
+#     topic name, a rule's CreatedBy, or proximity to something else that's
+#     yours -- a phone number sitting on a topic/rule you own is not evidence
+#     it's your phone. (This one cost a wrong guess already: a phone number on
+#     one of your alarm topics turned out to belong to someone else, discovered
+#     only because you said so. See uvalib/aws/README.md.)
+#
+# Usage:
+#   alert-config [status]                                   Show everything tied to your identities
+#   alert-config subscribe --topic-arn ARN --protocol PROTO --notification-endpoint EP
+#                                                             Add an SNS subscription
+#   alert-config unsubscribe <subscription-arn>              Remove an SNS subscription
+#   alert-config rule-enable <rule-name-or-arn>              Enable a CodeStar notification rule
+#   alert-config rule-disable <rule-name-or-arn>             Disable a CodeStar notification rule
+#   alert-config rule-add-target <rule> <topic-arn>          Add an SNS target to a rule
+#   alert-config rule-remove-target <rule> <topic-arn>       Remove an SNS target from a rule
+#
+# Config (uvalib/aws/config.json, "identities" key):
+#   emails   email addresses confirmed to be you
+#   phones   phone numbers confirmed to be you -- add one only once you've
+#            verified it yourself; this script will never add or infer one
+#
+# Env:
+#   AWS_VAULT_PROFILE   aws-vault profile to use (default: staging)
+#   AWS_DEFAULT_REGION  AWS region (default: us-east-1)
+#
+# Examples:
+#   alert-config
+#   alert-config unsubscribe arn:aws:sns:us-east-1:115119339709:some-topic:sub-id
+#   alert-config rule-disable uva-drupal-dh-staging-codepipeline-notification-rule-ys2n
+#   alert-config rule-add-target my-rule arn:aws:sns:us-east-1:115119339709:some-topic
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+PROFILE="${AWS_VAULT_PROFILE:-staging}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+# Run an aws command with credentials. Prefers creds already in the environment
+# (e.g. when invoked under `aws-vault exec`); otherwise falls back to aws-vault.
+# Mirrors the aws_run helper in ./alb-state, ./mandala-logs, ./scan-alerts, ./alarm-watch.
+aws_run() {
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_PROFILE:-}" ]]; then
+    aws "$@"
+  elif command -v aws-vault &>/dev/null; then
+    aws-vault exec "$PROFILE" -- aws "$@"
+  else
+    aws "$@"
+  fi
+}
+aws_sns()      { aws_run sns "$@"; }
+aws_codestar() { aws_run codestar-notifications "$@"; }
+
+usage() { sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+[[ -f "$CONFIG_FILE" ]] || { echo "No config.json found at $CONFIG_FILE" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required." >&2; exit 1; }
+
+# Load confirmed identities into plain indexed arrays (bash-3.2 safe: no mapfile,
+# no associative arrays). Expanding a possibly-empty array as "${arr[@]}" throws
+# "unbound variable" under set -u on bash 3.2 -- every expansion below uses the
+# "${arr[@]:-}" guard, which still yields one empty-string iteration on a truly
+# empty array, so loop bodies also check [[ -n "$x" ]].
+EMAILS=()
+while IFS= read -r e; do
+  [[ -n "$e" ]] && EMAILS+=("$e")
+done < <(jq -r '.identities.emails[]? // empty' "$CONFIG_FILE")
+
+PHONES=()
+while IFS= read -r p; do
+  [[ -n "$p" ]] && PHONES+=("$p")
+done < <(jq -r '.identities.phones[]? // empty' "$CONFIG_FILE")
+
+# True only on an exact match against a configured identity. Never a
+# substring/prefix match, never inferred from anything else.
+is_identity() {
+  local target="$1"
+  for e in "${EMAILS[@]:-}"; do [[ -n "$e" && "$target" == "$e" ]] && return 0; done
+  for p in "${PHONES[@]:-}"; do [[ -n "$p" && "$target" == "$p" ]] && return 0; done
+  return 1
+}
+
+# name or ARN -> notification rule ARN.
+resolve_rule_arn() {
+  local ref="$1"
+  if [[ "$ref" == arn:aws:codestar-notifications:* ]]; then
+    echo "$ref"
+    return 0
+  fi
+  local arn=""
+  while IFS= read -r a; do
+    [[ -z "$a" ]] && continue
+    local n
+    n="$(aws_codestar describe-notification-rule --arn "$a" --query Name --output text 2>/dev/null)"
+    if [[ "$n" == "$ref" ]]; then
+      arn="$a"
+      break
+    fi
+  done < <(aws_codestar list-notification-rules --query 'NotificationRules[].Arn' --output text 2>/dev/null | tr '\t' '\n')
+  if [[ -z "$arn" ]]; then
+    echo "No notification rule found matching name or ARN: $ref" >&2
+    exit 1
+  fi
+  echo "$arn"
+}
+
+# ---------------------------------------------------------------------------
+# status (default): everything tied to your confirmed identities
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local MY_USER_ID
+  MY_USER_ID="$(aws_run sts get-caller-identity --query UserId --output text)"
+
+  echo "=================================================================="
+  echo " Alert config status   $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=================================================================="
+  echo
+
+  # Build a JSON array of confirmed identities once, reused by every jq filter below.
+  local IDENTITIES_JSON
+  IDENTITIES_JSON="$(printf '%s\n' "${EMAILS[@]:-}" "${PHONES[@]:-}" | jq -R 'select(length > 0)' | jq -s .)"
+
+  echo "SNS SUBSCRIPTIONS (endpoint matches a confirmed identity)"
+  echo "------------------------------------------------------------------"
+  local SUBS
+  SUBS="$(aws_sns list-subscriptions --output json | \
+    jq -c --argjson ids "$IDENTITIES_JSON" '[.Subscriptions[] | select(.Endpoint as $e | $ids | index($e) != null)]')"
+
+  local SUB_COUNT
+  SUB_COUNT="$(jq 'length' <<<"$SUBS")"
+  if [[ "$SUB_COUNT" -eq 0 ]]; then
+    echo "  (none)"
+  else
+    while IFS=$'\t' read -r TOPIC PROTOCOL ENDPOINT ARN; do
+      [[ -z "$ARN" ]] && continue
+      local FP
+      FP="$(aws_sns get-subscription-attributes --subscription-arn "$ARN" \
+        --query 'Attributes.FilterPolicy' --output text 2>/dev/null || echo "None")"
+      [[ "$FP" == "None" || -z "$FP" ]] && FP="none" || FP="custom"
+      printf "  %-60s %-12s %-25s filter: %s\n" "${TOPIC##*:}" "$PROTOCOL" "$ENDPOINT" "$FP"
+      printf "    %s\n" "$ARN"
+    done < <(jq -r '.[] | [.TopicArn, .Protocol, .Endpoint, .SubscriptionArn] | @tsv' <<<"$SUBS")
+  fi
+
+  echo
+  echo "CODESTAR NOTIFICATION RULES (created by you)"
+  echo "------------------------------------------------------------------"
+  local RULE_ARNS RULE_COUNT=0
+  RULE_ARNS="$(aws_codestar list-notification-rules --query 'NotificationRules[].Arn' --output text 2>/dev/null | tr '\t' '\n')"
+
+  while IFS= read -r arn; do
+    [[ -z "$arn" ]] && continue
+    local DETAIL CREATED_BY
+    DETAIL="$(aws_codestar describe-notification-rule --arn "$arn" --output json 2>/dev/null)" || continue
+    CREATED_BY="$(jq -r '.CreatedBy' <<<"$DETAIL")"
+    [[ "$CREATED_BY" != "$MY_USER_ID" ]] && continue
+
+    (( RULE_COUNT++ )) || true
+    local NAME RESOURCE STATUS
+    NAME="$(jq -r '.Name' <<<"$DETAIL")"
+    RESOURCE="$(jq -r '.Resource' <<<"$DETAIL")"
+    STATUS="$(jq -r '.Status' <<<"$DETAIL")"
+
+    echo "  $NAME  [$STATUS]"
+    echo "    resource: $RESOURCE"
+    echo "    targets:"
+    while IFS=$'\t' read -r TARGET_TYPE TARGET_ADDR; do
+      [[ -z "$TARGET_ADDR" ]] && continue
+      echo "      $TARGET_ADDR ($TARGET_TYPE)"
+      if [[ "$TARGET_TYPE" == "SNS" ]]; then
+        while IFS=$'\t' read -r T_PROTOCOL T_ENDPOINT; do
+          [[ -z "$T_ENDPOINT" ]] && continue
+          if is_identity "$T_ENDPOINT"; then
+            echo "        -> $T_ENDPOINT ($T_PROTOCOL)  [confirmed: you]"
+          else
+            echo "        -> $T_ENDPOINT ($T_PROTOCOL)  [unverified endpoint]"
+          fi
+        done < <(aws_sns list-subscriptions-by-topic --topic-arn "$TARGET_ADDR" \
+          --query 'Subscriptions[].[Protocol,Endpoint]' --output text 2>/dev/null)
+      fi
+    done < <(jq -r '.Targets[] | [.TargetType, .TargetAddress] | @tsv' <<<"$DETAIL")
+    echo
+  done <<< "$RULE_ARNS"
+
+  [[ "$RULE_COUNT" -eq 0 ]] && echo "  (none)"
+
+  echo
+  echo "To remove an SNS subscription: $0 unsubscribe <subscription-arn>"
+  echo "To add one:                    $0 subscribe --topic-arn ARN --protocol PROTO --notification-endpoint EP"
+  echo "To enable/disable a rule:      $0 rule-enable|rule-disable <rule>"
+  echo "To change a rule's targets:    $0 rule-add-target|rule-remove-target <rule> <topic-arn>"
+}
+
+# ---------------------------------------------------------------------------
+# subscribe / unsubscribe
+# ---------------------------------------------------------------------------
+cmd_subscribe() {
+  local TOPIC_ARN="" PROTOCOL="" ENDPOINT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --topic-arn)              TOPIC_ARN="$2"; shift 2 ;;
+      --protocol)                PROTOCOL="$2"; shift 2 ;;
+      --notification-endpoint)   ENDPOINT="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
+  if [[ -z "$TOPIC_ARN" || -z "$PROTOCOL" || -z "$ENDPOINT" ]]; then
+    echo "Usage: $0 subscribe --topic-arn ARN --protocol PROTO --notification-endpoint EP" >&2
+    exit 1
+  fi
+
+  echo "About to create a new SNS subscription:"
+  echo "  Topic:    $TOPIC_ARN"
+  echo "  Protocol: $PROTOCOL"
+  echo "  Endpoint: $ENDPOINT"
+  echo
+  if is_identity "$ENDPOINT"; then
+    echo "(confirmed: this endpoint is in your identities)"
+  else
+    echo "NOTE: $ENDPOINT is not in notifications.identities. This subscription will"
+    echo "      be created regardless -- add it to config.json afterward if you want"
+    echo "      future 'status' runs to recognize it as yours."
+  fi
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
+
+  aws_sns subscribe --topic-arn "$TOPIC_ARN" --protocol "$PROTOCOL" --notification-endpoint "$ENDPOINT"
+
+  echo
+  case "$PROTOCOL" in
+    email|email-json) echo "Subscription created (pending). Check $ENDPOINT for a confirmation link." ;;
+    *)                echo "Subscription created." ;;
+  esac
+}
+
+cmd_unsubscribe() {
+  local SUB_ARN="${1:-}"
+  [[ -z "$SUB_ARN" ]] && { echo "Usage: $0 unsubscribe <subscription-arn>" >&2; exit 1; }
+
+  local ATTRS TOPIC PROTOCOL ENDPOINT
+  ATTRS="$(aws_sns get-subscription-attributes --subscription-arn "$SUB_ARN" --output json 2>/dev/null)" || {
+    echo "Could not find subscription: $SUB_ARN" >&2
+    exit 1
+  }
+  TOPIC="$(jq -r '.Attributes.TopicArn' <<<"$ATTRS")"
+  PROTOCOL="$(jq -r '.Attributes.Protocol' <<<"$ATTRS")"
+  ENDPOINT="$(jq -r '.Attributes.Endpoint' <<<"$ATTRS")"
+
+  echo "About to remove SNS subscription:"
+  echo "  Topic:    $TOPIC"
+  echo "  Protocol: $PROTOCOL"
+  echo "  Endpoint: $ENDPOINT"
+  if is_identity "$ENDPOINT"; then
+    echo "  (confirmed: this endpoint is in your identities)"
+  else
+    echo "  (unverified endpoint -- not in your identities; make sure you mean to remove this)"
+  fi
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
+
+  aws_sns unsubscribe --subscription-arn "$SUB_ARN"
+  echo
+  echo "Removed."
+}
+
+# ---------------------------------------------------------------------------
+# rule-enable / rule-disable
+# ---------------------------------------------------------------------------
+cmd_rule_set_status() {
+  local TARGET_STATUS="$1" REF="${2:-}"
+  if [[ -z "$REF" ]]; then
+    echo "Usage: $0 rule-$([[ "$TARGET_STATUS" == ENABLED ]] && echo enable || echo disable) <rule-name-or-arn>" >&2
+    exit 1
+  fi
+
+  local ARN DETAIL NAME CURRENT
+  ARN="$(resolve_rule_arn "$REF")"
+  DETAIL="$(aws_codestar describe-notification-rule --arn "$ARN" --output json)"
+  NAME="$(jq -r '.Name' <<<"$DETAIL")"
+  CURRENT="$(jq -r '.Status' <<<"$DETAIL")"
+
+  echo "Rule: $NAME"
+  echo "  Current status: $CURRENT"
+  echo "  New status:     $TARGET_STATUS"
+
+  if [[ "$CURRENT" == "$TARGET_STATUS" ]]; then
+    echo
+    echo "Already $TARGET_STATUS -- nothing to do."
+    return 0
+  fi
+
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
+
+  aws_codestar update-notification-rule --arn "$ARN" --status "$TARGET_STATUS"
+  echo
+  echo "Updated."
+}
+
+# ---------------------------------------------------------------------------
+# rule-add-target / rule-remove-target
+# ---------------------------------------------------------------------------
+cmd_rule_retarget() {
+  local MODE="$1" REF="${2:-}" TOPIC_ARN="${3:-}"
+  if [[ -z "$REF" || -z "$TOPIC_ARN" ]]; then
+    echo "Usage: $0 rule-$MODE-target <rule-name-or-arn> <topic-arn>" >&2
+    exit 1
+  fi
+
+  local ARN DETAIL NAME CURRENT_TARGETS
+  ARN="$(resolve_rule_arn "$REF")"
+  DETAIL="$(aws_codestar describe-notification-rule --arn "$ARN" --output json)"
+  NAME="$(jq -r '.Name' <<<"$DETAIL")"
+  CURRENT_TARGETS="$(jq -c '[.Targets[].TargetAddress]' <<<"$DETAIL")"
+
+  local NEW_TARGETS
+  if [[ "$MODE" == "add" ]]; then
+    if jq -e --arg t "$TOPIC_ARN" 'index($t) != null' <<<"$CURRENT_TARGETS" >/dev/null; then
+      echo "$TOPIC_ARN is already a target of $NAME -- nothing to do."
+      return 0
+    fi
+    NEW_TARGETS="$(jq -c --arg t "$TOPIC_ARN" '. + [$t]' <<<"$CURRENT_TARGETS")"
+  else
+    if ! jq -e --arg t "$TOPIC_ARN" 'index($t) != null' <<<"$CURRENT_TARGETS" >/dev/null; then
+      echo "$TOPIC_ARN is not currently a target of $NAME -- nothing to do."
+      return 0
+    fi
+    NEW_TARGETS="$(jq -c --arg t "$TOPIC_ARN" 'map(select(. != $t))' <<<"$CURRENT_TARGETS")"
+    if [[ "$(jq 'length' <<<"$NEW_TARGETS")" -eq 0 ]]; then
+      echo "Refusing: this would remove the rule's last target, leaving it with nowhere" >&2
+      echo "to notify. Use '$0 rule-disable $REF' instead if you want to silence it." >&2
+      exit 1
+    fi
+  fi
+
+  echo "Rule: $NAME"
+  echo "Current targets:"
+  jq -r '.[]' <<<"$CURRENT_TARGETS" | sed 's/^/  /'
+  echo "New targets:"
+  jq -r '.[]' <<<"$NEW_TARGETS" | sed 's/^/  /'
+  echo
+  echo "Type 'yes' to continue:"
+  read -r CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { echo "Cancelled."; exit 1; }
+
+  # update-notification-rule's --targets is a full replace, not additive --
+  # NEW_TARGETS above was built as current + delta for exactly that reason.
+  local TARGETS_JSON
+  TARGETS_JSON="$(jq -c '[.[] | {TargetType: "SNS", TargetAddress: .}]' <<<"$NEW_TARGETS")"
+  aws_codestar update-notification-rule --arn "$ARN" --targets "$TARGETS_JSON"
+  echo
+  echo "Updated."
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+case "${1:-status}" in
+  status)             shift; cmd_status "$@" ;;
+  subscribe)           shift; cmd_subscribe "$@" ;;
+  unsubscribe)         shift; cmd_unsubscribe "$@" ;;
+  rule-enable)         shift; cmd_rule_set_status ENABLED "$@" ;;
+  rule-disable)        shift; cmd_rule_set_status DISABLED "$@" ;;
+  rule-add-target)     shift; cmd_rule_retarget add "$@" ;;
+  rule-remove-target)  shift; cmd_rule_retarget remove "$@" ;;
+  -h|--help)           usage 0 ;;
+  *)                   echo "Unknown command: $1" >&2; usage 1 ;;
+esac
