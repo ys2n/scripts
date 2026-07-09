@@ -2,6 +2,7 @@
 
 import curses
 import json
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -16,11 +17,27 @@ class PipelineError(Exception):
     """Custom exception for pipeline operations"""
     pass
 
+def resolve_aws_command(cmd_args):
+    """Prefix an aws CLI command with aws-vault if needed.
+
+    Prefers credentials already in the environment (e.g. AWS_ACCESS_KEY_ID or
+    AWS_PROFILE, such as inside an `aws-vault exec` session); otherwise falls
+    back to `aws-vault exec $AWS_VAULT_PROFILE`. Mirrors the aws_run helper in
+    ./alb-state, ./mandala-logs, and ./scan-alerts -- the interactive shell's
+    `aws` alias to aws-vault is not inherited by this subprocess.
+    """
+    if os.environ.get('AWS_ACCESS_KEY_ID') or os.environ.get('AWS_PROFILE'):
+        return cmd_args
+    if shutil.which('aws-vault'):
+        profile = os.environ.get('AWS_VAULT_PROFILE', 'staging')
+        return ['aws-vault', 'exec', profile, '--'] + cmd_args
+    return cmd_args
+
 def execute_aws_command(cmd_args):
     """Execute AWS CLI command with error handling"""
     try:
         result = subprocess.run(
-            cmd_args,
+            resolve_aws_command(cmd_args),
             capture_output=True,
             text=True,
             check=True
